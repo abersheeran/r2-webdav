@@ -1,0 +1,16 @@
+name = "r2-webdav"
+main = "build/worker/shim.mjs"
+compatibility_date = "2023-03-22"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[[r2_buckets]]
+binding = 'webdav' # <~ valid JavaScript variable name
+bucket_name = 'webdav'
+
+[vars]
+PROTOCOL = "r2"
+BUCKET_NAME = "webdav"
+USERNAME = "USERNAME"
+PASSWORD = "PASSWORD"
