@@ -1,32 +1,26 @@
-# Template: worker-rust
+# r2-webdav
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/worker-rust)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/abersheeran/r2-webdav)
 
-A template for kick starting a Cloudflare worker project using [`workers-rs`](https://github.com/cloudflare/workers-rs).
+Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
-This template is designed for compiling Rust to WebAssembly and publishing the resulting worker to Cloudflare's [edge infrastructure](https://www.cloudflare.com/network/).
+## Configuration
 
-## Setup
+Change wrangler.toml to your own.
 
-To create a `my-project` directory using this template, run:
+```toml
+[[r2_buckets]]
+binding = 'webdav' # <~ valid JavaScript variable name
+bucket_name = 'webdav'
 
-```sh
-$ npx wrangler generate my-project https://github.com/cloudflare/workers-sdk/templates/experimental/worker-rust
-# or
-$ yarn wrangler generate my-project https://github.com/cloudflare/workers-sdk/templates/experimental/worker-rust
-# or
-$ pnpm wrangler generate my-project https://github.com/cloudflare/workers-sdk/templates/experimental/worker-rust
+[vars]
+PROTOCOL = "r2"
+BUCKET_NAME = "webdav"
+USERNAME = "USERNAME"
+PASSWORD = "PASSWORD"
 ```
 
-## Wrangler
-
-Wrangler is used to develop, deploy, and configure your Worker via CLI.
-
-Further documentation for Wrangler can be found [here](https://developers.cloudflare.com/workers/tooling/wrangler).
-
-## Usage
-
-This template starts you off with a `src/lib.rs` file, acting as an entrypoint for requests hitting your Worker. Feel free to add more code in this file, or create Rust modules anywhere else for this project to use.
+## Development
 
 With `wrangler`, you can build, test, and deploy your Worker with the following commands:
 
@@ -39,13 +33,3 @@ $ npm run deploy
 ```
 
 Read the latest `worker` crate documentation here: https://docs.rs/worker
-
-## WebAssembly
-
-`workers-rs` (the Rust SDK for Cloudflare Workers used in this template) is meant to be executed as compiled WebAssembly, and as such so **must** all the code you write and depend upon. All crates and modules used in Rust-based Workers projects have to compile to the `wasm32-unknown-unknown` triple.
-
-Read more about this on the [`workers-rs`](https://github.com/cloudflare/workers-rs) project README.
-
-## Issues
-
-If you have any problems with the `worker` crate, please open an issue on the upstream project issue tracker on the [`workers-rs` repository](https://github.com/cloudflare/workers-rs).
