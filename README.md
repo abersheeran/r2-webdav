@@ -20,6 +20,11 @@ USERNAME = "USERNAME"
 PASSWORD = "PASSWORD"
 ```
 
+* PROTOCOL: `r2` only now.
+* BUCKET_NAME: The bucket name of R2.
+* USERNAME: The username of WebDav.
+* PASSWORD: The password of WebDav.
+
 ## Development
 
 With `wrangler`, you can build, test, and deploy your Worker with the following commands:
