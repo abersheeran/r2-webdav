@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 async-trait = "0.1.74"
 base64 = "0.21.5"
 lazy_static = "1.4.0"
-worker = "0.0.15"
+worker = "0.0.18"
 
 [profile.release]
 lto = true

@@ -10,9 +10,9 @@ pub struct Dav {
     fs: R2,
 }
 
-type DavResponse = (u16, HashMap<String, String>, String);
-type DavErrResponse = (u16, Option<HashMap<String, String>>, Option<String>);
-type DavStreamResponse = (u16, HashMap<String, String>, ByteStream);
+pub type DavResponse = (u16, HashMap<String, String>, String);
+pub type DavErrResponse = (u16, Option<HashMap<String, String>>, Option<String>);
+pub type DavStreamResponse = (u16, HashMap<String, String>, ByteStream);
 
 pub enum DavResponseType {
     DavResponse(Result<DavResponse, DavErrResponse>),
@@ -32,8 +32,16 @@ impl From<Result<DavStreamResponse, DavErrResponse>> for DavResponseType {
 }
 
 static DAV_CLASS: &str = "1";
-static SUPPORT_METHODS: [&str; 8] = [
-    "OPTIONS", "PROPFIND", "MKCOL", "GET", "HEAD", "PUT", "COPY", "MOVE",
+static SUPPORT_METHODS: [&str; 9] = [
+    "OPTIONS",
+    "PROPFIND",
+    "PROPPATCH",
+    "MKCOL",
+    "GET",
+    "HEAD",
+    "PUT",
+    "COPY",
+    "MOVE",
 ];
 
 impl Dav {
@@ -61,9 +69,9 @@ impl Dav {
         depth: Depth,
         req_body: String,
     ) -> Result<DavResponse, DavErrResponse> {
-        if req_body.len() > 0 {
-            return Err((415, None, None));
-        }
+        // if req_body.len() > 0 {
+        //     return Err((415, None, None));
+        // }
 
         let mut headers = HashMap::new();
         headers.insert(
@@ -78,7 +86,7 @@ impl Dav {
                     Some(vec![("xmlns:D".to_string(), "DAV:".to_string())]),
                     None,
                 );
-                match self.fs.list(path).await {
+                match self.fs.list(path.clone()).await {
                     Ok(items) => {
                         for (href, properties) in items {
                             let mut response =
@@ -124,7 +132,7 @@ impl Dav {
 
                         Ok((207, headers, multistatus.build()))
                     }
-                    Err(_) => return Err((404, None, None)),
+                    Err(message) => return Err((404, None, Some(message))),
                 }
             }
             Depth::Zero => {
@@ -133,12 +141,17 @@ impl Dav {
                     Some(vec![("xmlns:D".to_string(), "DAV:".to_string())]),
                     None,
                 );
-                match self.fs.get(path).await {
+                match self.fs.get(path.clone()).await {
                     Ok((href, properties)) => {
-                        let mut response = XMLBuilder::new("D:response".to_string(), None, None);
+                        let response = multistatus.elem("D:response".to_string(), None, None);
                         response.elem("D:href".to_string(), None, Some(href));
-                        let mut propstat = XMLBuilder::new("D:propstat".to_string(), None, None);
-                        let mut prop = XMLBuilder::new("D:prop".to_string(), None, None);
+                        let propstat = response.elem("D:propstat".to_string(), None, None);
+                        propstat.elem(
+                            "D:status".to_string(),
+                            None,
+                            Some("HTTP/1.1 200 OK".to_string()),
+                        );
+                        let prop = propstat.elem("D:prop".to_string(), None, None);
                         prop.elem("D:creationdate".to_string(), None, properties.creation_date);
                         prop.elem("D:displayname".to_string(), None, properties.display_name);
                         prop.elem(
@@ -164,27 +177,62 @@ impl Dav {
                             None,
                             properties.get_last_modified,
                         );
-                        propstat.add(prop);
+
+                        Ok((207, (headers), (multistatus.build())))
+                    }
+                    Err(_) => {
+                        if !path.ends_with("/") {
+                            return Err((404, None, None));
+                        }
+                        let response = multistatus.elem("D:response".to_string(), None, None);
+                        response.elem("D:href".to_string(), None, Some(path));
+                        let propstat = response.elem("D:propstat".to_string(), None, None);
                         propstat.elem(
                             "D:status".to_string(),
                             None,
                             Some("HTTP/1.1 200 OK".to_string()),
                         );
-                        response.add(propstat);
-                        multistatus.add(response);
+                        propstat.elem("D:prop".to_string(), None, None);
 
                         Ok((207, (headers), (multistatus.build())))
                     }
-                    Err(_) => return Err((404, None, None)),
                 }
             }
             Depth::Infinity => return Err((400, None, None)),
         }
     }
 
-    pub async fn handle_mkcol(
+    pub async fn handle_proppatch(
         &self,
         path: String,
+        req_body: String,
+    ) -> Result<DavResponse, DavErrResponse> {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Content-Type".to_string(),
+            "application/xml; charset=utf-8".to_string(),
+        );
+        let mut multistatus = XMLBuilder::new(
+            "D:multistatus".to_string(),
+            Some(vec![("xmlns:D".to_string(), "DAV:".to_string())]),
+            None,
+        );
+        let response = multistatus.elem("D:response".to_string(), None, None);
+        response.elem("D:href".to_string(), None, Some(path));
+        let propstat = response.elem("D:propstat".to_string(), None, None);
+        let prop = propstat.elem("D:prop".to_string(), None, None);
+        // TODO
+        propstat.elem(
+            "D:status".to_string(),
+            None,
+            Some("HTTP/1.1 200 OK".to_string()),
+        );
+        Ok((207, HashMap::new(), multistatus.build()))
+    }
+
+    pub async fn handle_mkcol(
+        &self,
+        _: String,
         req_body: String,
     ) -> Result<DavResponse, DavErrResponse> {
         if req_body.len() > 0 {
@@ -233,7 +281,7 @@ impl Dav {
                     _ => Ok((200, (headers), stream)),
                 }
             }
-            Err(_) => return Err((404, None, None)),
+            Err(message) => return Err((404, None, Some(message))),
         }
     }
 
@@ -261,7 +309,9 @@ impl Dav {
                     .join(", ");
                 return Ok((200, (headers), (html)));
             }
-            Err(_) => return Err((404, None, None)),
+            Err(message) => {
+                return Err((404, None, Some(message)));
+            }
         }
     }
 

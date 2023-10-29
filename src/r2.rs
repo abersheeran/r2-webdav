@@ -1,5 +1,5 @@
 use crate::values::{DavProperties, Range};
-use worker::{Bucket, ByteStream, FixedLengthStream, Range as R2Range};
+use worker::{console_debug, Bucket, ByteStream, FixedLengthStream, Headers, Range as R2Range};
 
 pub struct R2 {
     bucket: Bucket,
@@ -11,10 +11,9 @@ impl R2 {
     }
 
     pub async fn get(&self, path: String) -> Result<(String, DavProperties), String> {
-        let result = self.bucket.get(path).execute().await;
-        match result {
+        match self.bucket.get(path).execute().await {
             Ok(f) => f.map_or(Err("Resource not found".to_string()), |file| {
-                Ok((file.key(), DavProperties::from_r2(&file)))
+                Ok((file.key(), DavProperties::from(&file)))
             }),
             Err(error) => Err(error.to_string()),
         }
@@ -25,10 +24,23 @@ impl R2 {
             Ok(files) => {
                 let mut result = Vec::new();
                 for file in files.objects() {
-                    result.push((file.key(), DavProperties::from_r2(&file)))
+                    console_debug!("Access {}", file.key());
+                    result.push((file.key(), DavProperties::from(&file)))
                 }
                 Ok(result)
             }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub async fn patch_metadata(&self, path: String, metadata: Headers) -> Result<(), String> {
+        match self.bucket.get(path).execute().await {
+            Ok(f) => f.map_or(Err("Resource not found".to_string()), |file| {
+                match file.write_http_metadata(metadata) {
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -66,7 +78,7 @@ impl R2 {
                     .map_or(Err("Failed to get file body stream".to_string()), |b| {
                         b.stream().map_or(
                             Err("Failed to get file body stream".to_string()),
-                            |stream| Ok((DavProperties::from_r2(&file), stream)),
+                            |stream| Ok((DavProperties::from(&file), stream)),
                         )
                     })
             }),
@@ -93,7 +105,7 @@ impl R2 {
             .execute()
             .await
         {
-            Ok(file) => Ok(DavProperties::from_r2(&file)),
+            Ok(file) => Ok(DavProperties::from(&file)),
             Err(error) => Err(error.to_string()),
         }
     }

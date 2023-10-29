@@ -1,4 +1,4 @@
-use worker::Object;
+use worker::{console_debug, Object};
 
 #[derive(Default, Debug, Clone, PartialEq, Hash, Eq)]
 pub enum Depth {
@@ -90,9 +90,11 @@ pub struct DavProperties {
     pub get_last_modified: Option<String>,
 }
 
-impl DavProperties {
-    pub fn from_r2(file: &Object) -> DavProperties {
+impl From<&Object> for DavProperties {
+    fn from(file: &Object) -> DavProperties {
+        console_debug!("Calling from Object for DavProperties");
         let http_metedata = file.http_metadata();
+        console_debug!("http_metedata {:?}", http_metedata);
         DavProperties {
             creation_date: Some(file.uploaded().to_string()),
             display_name: http_metedata.content_disposition,
