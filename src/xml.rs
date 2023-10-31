@@ -1,19 +1,22 @@
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
 use std::collections::HashMap;
 
-pub struct XMLBuilder {
-    name: String,
-    value: Option<String>,
-    attributes: Option<HashMap<String, String>>,
-    elements: Vec<XMLBuilder>,
+#[derive(Default, Debug, Clone)]
+pub struct XMLNode {
+    pub name: String,
+    pub value: Option<String>,
+    pub attributes: Option<HashMap<String, String>>,
+    pub elements: Vec<XMLNode>,
 }
 
-impl XMLBuilder {
+impl XMLNode {
     pub fn new(
         name: String,
         attributes: Option<Vec<(String, String)>>,
         value: Option<String>,
-    ) -> XMLBuilder {
-        XMLBuilder {
+    ) -> XMLNode {
+        XMLNode {
             name,
             value,
             attributes: attributes.map(|v| v.into_iter().collect()),
@@ -26,13 +29,13 @@ impl XMLBuilder {
         name: String,
         attributes: Option<Vec<(String, String)>>,
         value: Option<String>,
-    ) -> &mut XMLBuilder {
-        let el = XMLBuilder::new(name, attributes, value);
+    ) -> &mut XMLNode {
+        let el = XMLNode::new(name, attributes, value);
         self.elements.push(el);
         self.elements.last_mut().unwrap()
     }
 
-    pub fn add(&mut self, element: XMLBuilder) {
+    pub fn add(&mut self, element: XMLNode) {
         self.elements.push(element);
     }
 
@@ -43,7 +46,7 @@ impl XMLBuilder {
         xml.join("")
     }
 
-    fn write_element(&self, element: &XMLBuilder) -> String {
+    fn write_element(&self, element: &XMLNode) -> String {
         let mut xml = Vec::new();
         // attributes
         let mut attrs = Vec::new();
@@ -69,22 +72,91 @@ impl XMLBuilder {
         xml.push(format!("</{}>", element.name));
         xml.join("")
     }
+
+    pub fn parse_xml(xml: &str) -> Result<XMLNode, String> {
+        let mut reader = Reader::from_str(xml);
+        reader.trim_text(true);
+        let mut buf = Vec::new();
+        let mut elements: Vec<XMLNode> = Vec::new();
+        let mut stack: Vec<(String, HashMap<String, String>, String)> = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => {
+                    stack.push((
+                        std::str::from_utf8(e.name().as_ref()).unwrap().to_string(),
+                        e.attributes()
+                            .map(|a| {
+                                let a = a.unwrap();
+                                (
+                                    std::str::from_utf8(a.key.as_ref()).unwrap().to_string(),
+                                    std::str::from_utf8(a.value.as_ref()).unwrap().to_string(),
+                                )
+                            })
+                            .collect(),
+                        "".to_string(),
+                    ));
+                }
+                Ok(Event::End(_)) => {
+                    stack.pop().map(|(name, attributes, value)| {
+                        let mut element =
+                            XMLNode::new(name, Some(attributes.into_iter().collect()), Some(value));
+                        match elements.pop() {
+                            None => {
+                                let _ = &elements.push(element.clone());
+                            }
+                            Some(c) => {
+                                element.add(c);
+                                let _ = &elements.push(element);
+                            }
+                        };
+                    });
+                }
+                Ok(Event::Text(e)) => {
+                    stack.pop().map(|(name, attributes, _)| {
+                        stack.push((name, attributes, e.unescape().unwrap().into_owned()));
+                    });
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => {
+                    return Err(format!(
+                        "Error at position {}: {:?}",
+                        reader.buffer_position(),
+                        e
+                    ))
+                }
+                _ => (),
+            }
+            buf.clear();
+        }
+        if elements.len() == 1 {
+            Ok(elements.pop().unwrap())
+        } else {
+            Err(format!("XMLNode parse error, {:?}", elements))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::xml::XMLBuilder;
+    use crate::xml::XMLNode;
 
     #[test]
     fn xml_build() {
-        let mut xml = XMLBuilder::new("root".to_string(), None, None);
+        let mut xml = XMLNode::new("root".to_string(), None, None);
         xml.elem("child".to_string(), None, None)
             .elem("grandchild".to_string(), None, None)
-            .add(XMLBuilder::new(
+            .add(XMLNode::new(
                 "greatgrandchild".to_string(),
                 None,
                 Some("value".to_string()),
             ));
         assert!(xml.build() == "<?xml version=\"1.0\" encoding=\"utf-8\"?><root><child><grandchild><greatgrandchild>value</greatgrandchild></grandchild></child></root>")
+    }
+
+    #[test]
+    fn xml_parse() {
+        let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?><root><child><grandchild><greatgrandchild>value</greatgrandchild></grandchild></child></root>";
+        let xml = XMLNode::parse_xml(xml).unwrap();
+        assert!(xml.build() == "<?xml version=\"1.0\" encoding=\"utf-8\"?><root><child><grandchild><greatgrandchild>value</greatgrandchild></grandchild></child></root>", "{}", xml.build())
     }
 }

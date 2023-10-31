@@ -1,4 +1,4 @@
-use worker::{console_debug, Object};
+use worker::{console_debug, Date, HttpMetadata, Object};
 
 #[derive(Default, Debug, Clone, PartialEq, Hash, Eq)]
 pub enum Depth {
@@ -103,6 +103,25 @@ impl From<&Object> for DavProperties {
             get_content_type: http_metedata.content_type,
             get_etag: Some(file.http_etag()),
             get_last_modified: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpResponseHeaders {
+    pub content_disposition: Option<String>,
+    pub content_encoding: Option<String>,
+    pub cache_control: Option<String>,
+    pub cache_expiry: Option<Date>,
+}
+
+impl From<HttpMetadata> for HttpResponseHeaders {
+    fn from(value: HttpMetadata) -> Self {
+        HttpResponseHeaders {
+            content_disposition: value.content_disposition,
+            content_encoding: value.content_encoding,
+            cache_control: value.cache_control,
+            cache_expiry: value.cache_expiry,
         }
     }
 }

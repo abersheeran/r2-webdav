@@ -1,4 +1,6 @@
-use crate::values::{DavProperties, Range};
+use std::collections::HashMap;
+
+use crate::values::{DavProperties, HttpResponseHeaders, Range};
 use worker::{console_debug, Bucket, ByteStream, FixedLengthStream, Headers, Range as R2Range};
 
 pub struct R2 {
@@ -10,10 +12,26 @@ impl R2 {
         R2 { bucket }
     }
 
-    pub async fn get(&self, path: String) -> Result<(String, DavProperties), String> {
+    pub async fn get(
+        &self,
+        path: String,
+    ) -> Result<
+        (
+            String,
+            DavProperties,
+            HttpResponseHeaders,
+            HashMap<String, String>,
+        ),
+        String,
+    > {
         match self.bucket.get(path).execute().await {
             Ok(f) => f.map_or(Err("Resource not found".to_string()), |file| {
-                Ok((file.key(), DavProperties::from(&file)))
+                Ok((
+                    file.key(),
+                    DavProperties::from(&file),
+                    HttpResponseHeaders::from(file.http_metadata()),
+                    file.custom_metadata().unwrap_or(HashMap::new()),
+                ))
             }),
             Err(error) => Err(error.to_string()),
         }
@@ -33,14 +51,37 @@ impl R2 {
         }
     }
 
-    pub async fn patch_metadata(&self, path: String, metadata: Headers) -> Result<(), String> {
-        match self.bucket.get(path).execute().await {
-            Ok(f) => f.map_or(Err("Resource not found".to_string()), |file| {
-                match file.write_http_metadata(metadata) {
-                    Ok(_) => Ok(()),
-                    Err(error) => Err(error.to_string()),
+    pub async fn patch_metadata(
+        &self,
+        path: String,
+        metadata: HashMap<String, String>,
+    ) -> Result<HashMap<String, String>, String> {
+        match self.bucket.get(path.clone()).execute().await {
+            Ok(f) => match f {
+                Some(file) => {
+                    let stream = match file.body() {
+                        Some(body) => match body.stream() {
+                            Ok(s) => s,
+                            Err(e) => return Err(e.to_string()),
+                        },
+                        None => return Err("Failed to get file body stream".to_string()),
+                    };
+                    match self
+                        .bucket
+                        .put(path, FixedLengthStream::wrap(stream, file.size().into()))
+                        .custom_metadata(metadata)
+                        .execute()
+                        .await
+                    {
+                        Ok(file) => match file.custom_metadata() {
+                            Ok(metadata) => Ok(metadata),
+                            Err(e) => Err(e.to_string()),
+                        },
+                        Err(error) => Err(error.to_string()),
+                    }
                 }
-            }),
+                None => Err("Resource not found".to_string()),
+            },
             Err(error) => Err(error.to_string()),
         }
     }
@@ -49,7 +90,7 @@ impl R2 {
         &self,
         path: String,
         range: Range,
-    ) -> Result<(DavProperties, ByteStream), String> {
+    ) -> Result<(DavProperties, HttpResponseHeaders, ByteStream), String> {
         let r2range: Option<R2Range> = match (range.start, range.end) {
             (Some(start), Some(end)) => Some(R2Range::OffsetWithLength {
                 offset: start,
@@ -78,7 +119,13 @@ impl R2 {
                     .map_or(Err("Failed to get file body stream".to_string()), |b| {
                         b.stream().map_or(
                             Err("Failed to get file body stream".to_string()),
-                            |stream| Ok((DavProperties::from(&file), stream)),
+                            |stream| {
+                                Ok((
+                                    DavProperties::from(&file),
+                                    HttpResponseHeaders::from(file.http_metadata()),
+                                    stream,
+                                ))
+                            },
                         )
                     })
             }),

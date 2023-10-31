@@ -2,7 +2,7 @@ use worker::ByteStream;
 
 use crate::r2::R2;
 use crate::values::{Depth, Overwrite, Range};
-use crate::xml::XMLBuilder;
+use crate::xml::XMLNode;
 use std::collections::HashMap;
 use std::option::Option;
 
@@ -69,9 +69,15 @@ impl Dav {
         depth: Depth,
         req_body: String,
     ) -> Result<DavResponse, DavErrResponse> {
-        // if req_body.len() > 0 {
-        //     return Err((415, None, None));
-        // }
+        let mut xml;
+        if req_body.len() > 0 {
+            match XMLNode::parse_xml(&req_body) {
+                Ok(v) => xml = v,
+                Err(_) => return Err((415, None, None)),
+            };
+        } else {
+            return Err((415, None, None));
+        }
 
         let mut headers = HashMap::new();
         headers.insert(
@@ -81,7 +87,7 @@ impl Dav {
 
         match depth {
             Depth::One => {
-                let mut multistatus = XMLBuilder::new(
+                let mut multistatus = XMLNode::new(
                     "D:multistatus".to_string(),
                     Some(vec![("xmlns:D".to_string(), "DAV:".to_string())]),
                     None,
@@ -89,45 +95,44 @@ impl Dav {
                 match self.fs.list(path.clone()).await {
                     Ok(items) => {
                         for (href, properties) in items {
-                            let mut response =
-                                XMLBuilder::new("D:response".to_string(), None, None);
+                            let response = multistatus.elem("D:response".to_string(), None, None);
                             response.elem("D:href".to_string(), None, Some(href));
-                            let mut propstat =
-                                XMLBuilder::new("D:propstat".to_string(), None, None);
-                            let mut prop = XMLBuilder::new("D:prop".to_string(), None, None);
-                            prop.elem("D:creationdate".to_string(), None, properties.creation_date);
-                            prop.elem("D:displayname".to_string(), None, properties.display_name);
-                            prop.elem(
-                                "D:getcontentlanguage".to_string(),
-                                None,
-                                properties.get_content_language,
-                            );
-                            prop.elem(
-                                "D:getcontentlength".to_string(),
-                                None,
-                                properties
-                                    .get_content_length
-                                    .map_or(None, |v| Some(v.to_string())),
-                            );
-                            prop.elem(
-                                "D:getcontenttype".to_string(),
-                                None,
-                                properties.get_content_type,
-                            );
-                            prop.elem("D:getetag".to_string(), None, properties.get_etag);
-                            prop.elem(
-                                "D:getlastmodified".to_string(),
-                                None,
-                                properties.get_last_modified,
-                            );
-                            propstat.add(prop);
+                            let propstat = response.elem("D:propstat".to_string(), None, None);
                             propstat.elem(
                                 "D:status".to_string(),
                                 None,
                                 Some("HTTP/1.1 200 OK".to_string()),
                             );
-                            response.add(propstat);
-                            multistatus.add(response);
+                            let prop = propstat.elem("D:prop".to_string(), None, None);
+                            properties
+                                .creation_date
+                                .map(|v| prop.elem("D:creationdate".to_string(), None, Some(v)));
+                            properties
+                                .display_name
+                                .map(|v| prop.elem("D:displayname".to_string(), None, Some(v)));
+                            properties.get_content_language.map(|v| {
+                                prop.elem("D:getcontentlanguage".to_string(), None, Some(v))
+                            });
+                            properties.get_content_length.map(|v| {
+                                prop.elem(
+                                    "D:getcontentlength".to_string(),
+                                    None,
+                                    Some(v.to_string()),
+                                )
+                            });
+                            properties
+                                .get_content_type
+                                .map(|v| prop.elem("D:getcontenttype".to_string(), None, Some(v)));
+                            properties
+                                .get_etag
+                                .map(|v| prop.elem("D:getetag".to_string(), None, Some(v)));
+                            properties.get_last_modified.map(|v| {
+                                prop.elem(
+                                    "D:getlastmodified".to_string(),
+                                    None,
+                                    Some(v.to_string()),
+                                )
+                            });
                         }
 
                         Ok((207, headers, multistatus.build()))
@@ -136,13 +141,13 @@ impl Dav {
                 }
             }
             Depth::Zero => {
-                let mut multistatus = XMLBuilder::new(
+                let mut multistatus = XMLNode::new(
                     "D:multistatus".to_string(),
                     Some(vec![("xmlns:D".to_string(), "DAV:".to_string())]),
                     None,
                 );
                 match self.fs.get(path.clone()).await {
-                    Ok((href, properties)) => {
+                    Ok((href, properties, _, custom_metadata)) => {
                         let response = multistatus.elem("D:response".to_string(), None, None);
                         response.elem("D:href".to_string(), None, Some(href));
                         let propstat = response.elem("D:propstat".to_string(), None, None);
@@ -152,31 +157,31 @@ impl Dav {
                             Some("HTTP/1.1 200 OK".to_string()),
                         );
                         let prop = propstat.elem("D:prop".to_string(), None, None);
-                        prop.elem("D:creationdate".to_string(), None, properties.creation_date);
-                        prop.elem("D:displayname".to_string(), None, properties.display_name);
-                        prop.elem(
-                            "D:getcontentlanguage".to_string(),
-                            None,
-                            properties.get_content_language,
-                        );
-                        prop.elem(
-                            "D:getcontentlength".to_string(),
-                            None,
-                            properties
-                                .get_content_length
-                                .map_or(None, |v| Some(v.to_string())),
-                        );
-                        prop.elem(
-                            "D:getcontenttype".to_string(),
-                            None,
-                            properties.get_content_type,
-                        );
-                        prop.elem("D:getetag".to_string(), None, properties.get_etag);
-                        prop.elem(
-                            "D:getlastmodified".to_string(),
-                            None,
-                            properties.get_last_modified,
-                        );
+                        properties
+                            .creation_date
+                            .map(|v| prop.elem("D:creationdate".to_string(), None, Some(v)));
+                        properties
+                            .display_name
+                            .map(|v| prop.elem("D:displayname".to_string(), None, Some(v)));
+                        properties
+                            .get_content_language
+                            .map(|v| prop.elem("D:getcontentlanguage".to_string(), None, Some(v)));
+                        properties.get_content_length.map(|v| {
+                            prop.elem("D:getcontentlength".to_string(), None, Some(v.to_string()))
+                        });
+                        properties
+                            .get_content_type
+                            .map(|v| prop.elem("D:getcontenttype".to_string(), None, Some(v)));
+                        properties
+                            .get_etag
+                            .map(|v| prop.elem("D:getetag".to_string(), None, Some(v)));
+                        properties.get_last_modified.map(|v| {
+                            prop.elem("D:getlastmodified".to_string(), None, Some(v.to_string()))
+                        });
+
+                        for (key, value) in custom_metadata {
+                            prop.elem(key, None, Some(value));
+                        }
 
                         Ok((207, (headers), (multistatus.build())))
                     }
@@ -212,7 +217,7 @@ impl Dav {
             "Content-Type".to_string(),
             "application/xml; charset=utf-8".to_string(),
         );
-        let mut multistatus = XMLBuilder::new(
+        let mut multistatus = XMLNode::new(
             "D:multistatus".to_string(),
             Some(vec![("xmlns:D".to_string(), "DAV:".to_string())]),
             None,
@@ -249,7 +254,7 @@ impl Dav {
         range: Range,
     ) -> Result<DavStreamResponse, DavErrResponse> {
         match self.fs.download(path, range.clone()).await {
-            Ok((properties, stream)) => {
+            Ok((properties, response_headers, stream)) => {
                 let mut headers: HashMap<String, String> = HashMap::new();
                 headers.insert("Accept-Ranges".to_string(), "bytes".to_string());
                 headers.insert(
@@ -270,6 +275,18 @@ impl Dav {
                 properties
                     .get_last_modified
                     .map(|v| headers.insert("Last-Modified".to_string(), v));
+                response_headers
+                    .cache_control
+                    .map(|v| headers.insert("Cache-Control".to_string(), v));
+                response_headers
+                    .cache_expiry
+                    .map(|v| headers.insert("Expires".to_string(), v.to_string()));
+                response_headers
+                    .content_disposition
+                    .map(|v| headers.insert("Content-Disposition".to_string(), v));
+                response_headers
+                    .content_encoding
+                    .map(|v| headers.insert("Content-Encoding".to_string(), v));
                 match (range.start, range.end) {
                     (Some(start), Some(end)) => {
                         headers.insert(
