@@ -461,7 +461,24 @@ export default {
 				}
 			}
 			case 'PROPPATCH': {
-
+				let request_xml = await xml2js.parseStringPromise(await request.text());
+				let setCustomMetadata = request_xml["D:propertyupdate"]["D:set"]["D:prop"];
+				let removeCustomMetadataKeys = Object.keys(request_xml["D:propertyupdate"]["D:remove"]["D:prop"]);
+				let object = await bucket.get(resource_path);
+				if (object === null) {
+					response = new Response('Not Found', { status: 404 });
+				} else {
+					await bucket.put(resource_path, object.body, {
+						httpMetadata: object.httpMetadata,
+						customMetadata: {
+							...Object.fromEntries(Object.entries(object.customMetadata ?? {}).filter(
+								([name, _]) => !removeCustomMetadataKeys.includes(name)
+							)),
+							...setCustomMetadata,
+						},
+					});
+					response = new Response('', { status: 200 });
+				}
 			}
 			default: {
 				response = new Response('Method Not Allowed', {
