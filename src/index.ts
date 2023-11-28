@@ -29,6 +29,8 @@ export interface Env {
 	PASSWORD: string;
 }
 
+import * as xml2js from 'xml2js';
+
 const DAV_CLASS = "1";
 const SUPPORT_METHODS = [
 	"OPTIONS",
@@ -50,6 +52,7 @@ type DavProperties = {
 	getcontenttype: string | undefined;
 	getetag: string | undefined;
 	getlastmodified: string | undefined;
+	resourcetype: string;
 }
 
 function fromR2Object(object: R2Object | null | undefined): DavProperties {
@@ -62,6 +65,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 			getcontenttype: undefined,
 			getetag: undefined,
 			getlastmodified: undefined,
+			resourcetype: '',
 		};
 	}
 
@@ -73,6 +77,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 		getcontenttype: object.httpMetadata?.contentType,
 		getetag: object.etag,
 		getlastmodified: object.uploaded.toUTCString(),
+		resourcetype: object.key.endsWith('/') ? '<collection />' : '',
 	};
 }
 
@@ -101,8 +106,8 @@ export default {
 						'Allow': SUPPORT_METHODS.join(', '),
 					}
 				});
-				break;
 			}
+				break;
 			case 'HEAD':
 			case 'GET': {
 				if (request.url.endsWith('/')) {
@@ -154,21 +159,26 @@ export default {
 						});
 					}
 				}
-				break;
 			}
+				break;
 			case 'PUT': {
 				if (resource_path.endsWith('/')) {
-					response = new Response('Forbidden', { status: 403 });
+					response = new Response('Method Not Allowed', { status: 405 });
 					break;
 				}
-				let body = await request.arrayBuffer();
-				await bucket.put(resource_path, body, {
-					onlyIf: request.headers,
-					httpMetadata: request.headers,
-				});
-				response = new Response('', { status: 201 });
-				break;
+				let dirpath = resource_path.split('/').slice(0, -1).join('/') + '/';
+				if (await bucket.head(dirpath)) {
+					let body = await request.arrayBuffer();
+					await bucket.put(resource_path, body, {
+						onlyIf: request.headers,
+						httpMetadata: request.headers,
+					});
+					response = new Response('', { status: 201 });
+				} else {
+					response = new Response('Conflict', { status: 409 });
+				}
 			}
+				break;
 			case 'DELETE': {
 				if (resource_path.endsWith('/')) {
 					let r2_objects = await bucket.list({
@@ -181,8 +191,8 @@ export default {
 					await bucket.delete(resource_path);
 				}
 				response = new Response(null, { status: 204 });
-				break;
 			}
+				break;
 			case 'MKCOL': {
 				if (request.body) {
 					response = new Response('Unsupported Media Type', { status: 415 });
@@ -202,8 +212,8 @@ export default {
 						response = new Response('', { status: 201 });
 					}
 				}
-				break;
 			}
+				break;
 			case 'PROPFIND': {
 				let depth = request.headers.get('Depth') ?? 'infinity';
 				switch (depth) {
@@ -237,8 +247,8 @@ export default {
 
 							console.log(await request.text(), page);
 						}
-						break;
 					}
+						break;
 					case '1': {
 						let r2_objects = await bucket.list({
 							prefix: resource_path,
@@ -276,9 +286,8 @@ export default {
 						});
 
 						console.log(await request.text(), page);
-
-						break;
 					}
+						break;
 					case 'infinity': {
 						let r2_objects = await bucket.list({
 							prefix: resource_path,
@@ -310,23 +319,148 @@ export default {
 						});
 
 						console.log(await request.text(), page);
-
-						break;
 					}
+						break;
 					default: {
 						response = new Response('Bad Request', { status: 400 });
+					}
+				}
+			}
+				break;
+			case 'COPY': {
+				let dont_overwrite = request.headers.get('Overwrite') === 'F';
+				let destination_header = request.headers.get('Destination');
+				if (destination_header === null) {
+					response = new Response('Bad Request', { status: 400 });
+					break;
+				}
+				let destination = new URL(destination_header).pathname.slice(1);
+				let destination_exists = await bucket.head(destination);
+				if (dont_overwrite && destination_exists) {
+					response = new Response('Precondition Failed', { status: 412 });
+					break;
+				}
+				if (resource_path.endsWith('/')) {
+					let depth = request.headers.get('Depth') ?? 'infinity';
+					switch (depth) {
+						case 'infinity': {
+							let r2_objects = await bucket.list({
+								prefix: resource_path,
+							});
+							await Promise.all(r2_objects.objects.map(
+								object => (async () => {
+									let target = destination + object.key.slice(resource_path.length);
+									let src = await bucket.get(object.key);
+									if (src !== null) {
+										await bucket.put(target, src.body, {
+											httpMetadata: object.httpMetadata,
+											customMetadata: object.customMetadata,
+										});
+									}
+								})()
+							));
+							response = new Response('', { status: 201 });
+						}
+							break;
+						case '0': {
+							let object = await bucket.get(resource_path);
+							if (object === null) {
+								response = new Response('Not Found', { status: 404 });
+								break;
+							}
+							await bucket.put(destination, object.body, {
+								httpMetadata: object.httpMetadata,
+								customMetadata: object.customMetadata,
+							});
+							response = new Response('', { status: 201 });
+						}
+							break;
+						default: {
+							response = new Response('Bad Request', { status: 400 });
+						}
+					}
+				} else {
+					let src = await bucket.get(resource_path);
+					if (src === null) {
+						response = new Response('Not Found', { status: 404 });
+						break;
+					}
+					await bucket.put(destination, src.body, {
+						httpMetadata: src.httpMetadata,
+						customMetadata: src.customMetadata,
+					});
+					if (destination_exists) {
+						response = new Response(null, { status: 204 });
+					} else {
+						response = new Response('', { status: 201 });
+					}
+				}
+			}
+				break;
+			case 'MOVE': {
+				let overwrite = request.headers.get('Overwrite') === 'T';
+				let destination_header = request.headers.get('Destination');
+				if (destination_header === null) {
+					response = new Response('Bad Request', { status: 400 });
+					break;
+				}
+				let destination = new URL(destination_header).pathname.slice(1);
+				let destination_exists = await bucket.head(destination);
+				if (destination_exists) {
+					if (overwrite) {
+						await Promise.all((await bucket.list({
+							prefix: destination,
+						})).objects.map(object => bucket.delete(object.key)));
+					} else {
+						response = new Response('Precondition Failed', { status: 412 });
 						break;
 					}
 				}
-				break;
+				if (resource_path.endsWith('/')) {
+					let depth = request.headers.get('Depth') ?? 'infinity';
+					switch (depth) {
+						case 'infinity': {
+							let r2_objects = await bucket.list({
+								prefix: resource_path,
+							});
+							await Promise.all(r2_objects.objects.map(
+								object => (async () => {
+									let target = destination + object.key.slice(resource_path.length);
+									let src = await bucket.get(object.key);
+									if (src !== null) {
+										await bucket.put(target, src.body, {
+											httpMetadata: object.httpMetadata,
+											customMetadata: object.customMetadata,
+										});
+										await bucket.delete(object.key);
+									}
+								})()
+							));
+							response = new Response('', { status: 201 });
+						}
+							break;
+						default: {
+							response = new Response('Bad Request', { status: 400 });
+						}
+					}
+				} else {
+					let src = await bucket.get(resource_path);
+					if (src === null) {
+						response = new Response('Not Found', { status: 404 });
+						break;
+					}
+					await bucket.put(destination, src.body, {
+						httpMetadata: src.httpMetadata,
+						customMetadata: src.customMetadata,
+					});
+					if (destination_exists) {
+						response = new Response(null, { status: 204 });
+					} else {
+						response = new Response('', { status: 201 });
+					}
+				}
 			}
 			case 'PROPPATCH': {
-
-			}
-			case 'COPY': {
-
-			}
-			case 'MOVE': {
 
 			}
 			default: {
@@ -337,7 +471,6 @@ export default {
 						'DAV': DAV_CLASS,
 					}
 				});
-				break;
 			}
 		}
 
