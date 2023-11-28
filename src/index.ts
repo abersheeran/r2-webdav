@@ -103,6 +103,7 @@ export default {
 				});
 				break;
 			}
+			case 'HEAD':
 			case 'GET': {
 				if (request.url.endsWith('/')) {
 					let r2_objects = await bucket.list({
@@ -338,6 +339,14 @@ export default {
 				});
 				break;
 			}
+		}
+
+		if (request.method === 'HEAD') {
+			response = new Response(null, {
+				status: response.status,
+				statusText: response.statusText,
+				headers: response.headers,
+			});
 		}
 
 		// Set CORS headers
