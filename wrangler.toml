@@ -2,6 +2,8 @@ compatibility_date = "2023-10-16"
 main = "src/index.ts"
 name = "r2-webdav"
 
+node_compat = true
+
 # Variable bindings. These are arbitrary, plaintext strings (similar to environment variables)
 # Note: Use secrets to store sensitive data.
 # Docs: https://developers.cloudflare.com/workers/platform/environment-variables
