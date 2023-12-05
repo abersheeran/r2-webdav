@@ -29,13 +29,10 @@ export interface Env {
 	PASSWORD: string;
 }
 
-import * as xml2js from 'xml2js';
-
 const DAV_CLASS = "1";
 const SUPPORT_METHODS = [
 	"OPTIONS",
 	"PROPFIND",
-	"PROPPATCH",
 	"MKCOL",
 	"GET",
 	"HEAD",
@@ -95,7 +92,7 @@ export default {
 
 		let response: Response;
 
-		let resource_path = new URL(request.url).pathname;
+		let resource_path = new URL(request.url).pathname.slice(1);
 
 		switch (request.method) {
 			case 'OPTIONS': {
@@ -113,9 +110,13 @@ export default {
 				if (request.url.endsWith('/')) {
 					let r2_objects = await bucket.list({
 						prefix: resource_path,
+						delimiter: '/',
 					});
 					let page = '';
-					for (let object of r2_objects.objects) {
+					for (let dirname of r2_objects.delimitedPrefixes) {
+						page += `<a href="${dirname}">${dirname}</a><br>`;
+					}
+					for (let object of r2_objects.objects.filter(object => !object.key.endsWith('/'))) {
 						page += `<a href="${object.key}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
 					}
 					response = new Response(page, { status: 200, headers: { 'Content-Type': 'text/html' } });
@@ -166,17 +167,20 @@ export default {
 					response = new Response('Method Not Allowed', { status: 405 });
 					break;
 				}
+
+				// Check if the parent directory exists
 				let dirpath = resource_path.split('/').slice(0, -1).join('/') + '/';
-				if (await bucket.head(dirpath)) {
-					let body = await request.arrayBuffer();
-					await bucket.put(resource_path, body, {
-						onlyIf: request.headers,
-						httpMetadata: request.headers,
-					});
-					response = new Response('', { status: 201 });
-				} else {
+				let dir = await bucket.head(dirpath);
+				if (!dir || dir.customMetadata?.resourcetype !== '<collection />') {
 					response = new Response('Conflict', { status: 409 });
 				}
+
+				let body = await request.arrayBuffer();
+				await bucket.put(resource_path, body, {
+					onlyIf: request.headers,
+					httpMetadata: request.headers,
+				});
+				response = new Response('', { status: 201 });
 			}
 				break;
 			case 'DELETE': {
@@ -196,28 +200,55 @@ export default {
 			case 'MKCOL': {
 				if (request.body) {
 					response = new Response('Unsupported Media Type', { status: 415 });
-				} else {
-					let parent_dir = resource_path.split('/').slice(0, -2).join("/") + '/';
-
-					if (!resource_path.endsWith('/')) {
-						response = new Response('Forbidden', { status: 403 });
-					} else if (await bucket.head(resource_path)) {
-						response = new Response('Method Not Allowed', { status: 405 });
-					} else if (parent_dir !== '/' && !await bucket.head(parent_dir)) {
-						response = new Response('Conflict', { status: 409 });
-					} else {
-						await bucket.put(resource_path, new Uint8Array(), {
-							httpMetadata: request.headers,
-						});
-						response = new Response('', { status: 201 });
-					}
+					break;
 				}
+
+				resource_path = resource_path.endsWith('/') ? resource_path : resource_path + '/';
+
+				// Check if the resource already exists
+				if (await bucket.head(resource_path)) {
+					response = new Response('Method Not Allowed', { status: 405 });
+					break;
+				}
+
+				// Check if the parent directory exists
+				let parent_dir = resource_path.split('/').slice(0, -2).join("/") + '/';
+
+				if (parent_dir !== '/' && !await bucket.head(parent_dir)) {
+					response = new Response('Conflict', { status: 409 });
+					break;
+				}
+
+				await bucket.put(resource_path, new Uint8Array(), { httpMetadata: request.headers });
+				response = new Response('', { status: 201 });
 			}
 				break;
 			case 'PROPFIND': {
 				let depth = request.headers.get('Depth') ?? 'infinity';
 				switch (depth) {
 					case '0': {
+						if (resource_path === "") {
+							response = new Response(`<?xml version="1.0" encoding="utf-8"?>
+<multistatus xmlns="DAV:">
+	<response>
+		<href>${resource_path}</href>
+		<propstat>
+			<prop>
+				<resourcetype><collection /></resourcetype>
+			</prop>
+			<status>HTTP/1.1 200 OK</status>
+		</propstat>
+	</response>
+</multistatus>
+							`, {
+								status: 207,
+								headers: {
+									'Content-Type': 'text/xml',
+								},
+							});
+							break;
+						}
+
 						let object = await bucket.get(resource_path);
 						if (object === null && !resource_path.endsWith('/')) {
 							response = new Response('Not Found', { status: 404 });
@@ -237,88 +268,70 @@ export default {
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>
-</multistatus>`;
+</multistatus>
+`;
 							response = new Response(page, {
 								status: 207,
 								headers: {
 									'Content-Type': 'text/xml',
 								},
 							});
-
-							console.log(await request.text(), page);
 						}
 					}
 						break;
 					case '1': {
-						let r2_objects = await bucket.list({
-							prefix: resource_path,
-						});
 						let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
-						for (let object of r2_objects.objects.filter(
-							object => {
-								let path = object.key.slice(resource_path.length);
-								return !path.includes('/') ||
-									(path.split('/').length === 2 && path.endsWith('/'));
+
+						let cursor: string | undefined = undefined;
+						do {
+							var r2_objects = await bucket.list({
+								prefix: resource_path,
+								delimiter: '/',
+								cursor: cursor,
+							});
+
+							for (let dirname of r2_objects.delimitedPrefixes) {
+								page += `
+	<response>
+		<href>${dirname}</href>
+		<propstat>
+			<prop>
+				<resourcetype><collection /></resourcetype>
+			</prop>
+			<status>HTTP/1.1 200 OK</status>
+		</propstat>
+	</response>`;
 							}
-						)) {
-							page += `
+
+							for (let object of r2_objects.objects.filter(object => !object.key.endsWith('/'))) {
+								page += `
 	<response>
 		<href>${object.key}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-									.filter(([_, value]) => value !== undefined)
-									.map(([key, value]) => `<${key}>${value}</${key}>`)
-									.join('\n')
-								}
+										.filter(([_, value]) => value !== undefined)
+										.map(([key, value]) => `<${key}>${value}</${key}>`)
+										.join('\n				')
+									}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>`;
-						}
-						page += '</multistatus>';
+							}
+
+							if (r2_objects.truncated) {
+								cursor = r2_objects.cursor;
+							}
+						} while (r2_objects.truncated)
+						page += '\n</multistatus>\n';
 						response = new Response(page, {
 							status: 207,
 							headers: {
 								'Content-Type': 'text/xml',
 							},
 						});
-
-						console.log(await request.text(), page);
-					}
-						break;
-					case 'infinity': {
-						let r2_objects = await bucket.list({
-							prefix: resource_path,
-						});
-						let page = `<?xml version="1.0" encoding="utf-8"?>
-<multistatus xmlns="DAV:">`;
-						for (let object of r2_objects.objects) {
-							page += `
-	<response>
-		<href>${object.key}</href>
-		<propstat>
-			<prop>
-				${Object.entries(fromR2Object(object))
-									.filter(([_, value]) => value !== undefined)
-									.map(([key, value]) => `<${key}>${value}</${key}>`)
-									.join('\n')
-								}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`;
-						}
-						page += '</multistatus>';
-						response = new Response(page, {
-							status: 207,
-							headers: {
-								'Content-Type': 'text/xml',
-							},
-						});
-
-						console.log(await request.text(), page);
 					}
 						break;
 					default: {
@@ -458,26 +471,6 @@ export default {
 					} else {
 						response = new Response('', { status: 201 });
 					}
-				}
-			}
-			case 'PROPPATCH': {
-				let request_xml = await xml2js.parseStringPromise(await request.text());
-				let setCustomMetadata = request_xml["D:propertyupdate"]["D:set"]["D:prop"];
-				let removeCustomMetadataKeys = Object.keys(request_xml["D:propertyupdate"]["D:remove"]["D:prop"]);
-				let object = await bucket.get(resource_path);
-				if (object === null) {
-					response = new Response('Not Found', { status: 404 });
-				} else {
-					await bucket.put(resource_path, object.body, {
-						httpMetadata: object.httpMetadata,
-						customMetadata: {
-							...Object.fromEntries(Object.entries(object.customMetadata ?? {}).filter(
-								([name, _]) => !removeCustomMetadataKeys.includes(name)
-							)),
-							...setCustomMetadata,
-						},
-					});
-					response = new Response('', { status: 200 });
 				}
 			}
 			default: {
