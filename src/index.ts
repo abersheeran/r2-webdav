@@ -368,11 +368,14 @@ export default {
 					break;
 				}
 				let destination = new URL(destination_header).pathname.slice(1);
-				let destination_exists = await bucket.head(destination);
-				if (dont_overwrite && destination_exists) {
-					response = new Response('Precondition Failed', { status: 412 });
+
+				// Check if the parent directory exists
+				let destination_parent = destination.split('/').slice(0, destination.endsWith('/') ? -2 : -1).join('/');
+				if (destination_parent !== '' && !await bucket.head(destination_parent)) {
+					response = new Response('Conflict', { status: 409 });
 					break;
 				}
+
 				if (resource_path.endsWith('/')) {
 					let depth = request.headers.get('Depth') ?? 'infinity';
 					switch (depth) {
@@ -380,6 +383,10 @@ export default {
 							let r2_objects = await bucket.list({
 								prefix: resource_path,
 							});
+							if (r2_objects.objects.length === 0) {
+								response = new Response('Not Found', { status: 404 });
+								break;
+							}
 							await Promise.all(r2_objects.objects.map(
 								object => (async () => {
 									let target = destination + object.key.slice(resource_path.length);
@@ -396,7 +403,7 @@ export default {
 						}
 							break;
 						case '0': {
-							let object = await bucket.get(resource_path);
+							let object = await bucket.get(resource_path.slice(0, -1));
 							if (object === null) {
 								response = new Response('Not Found', { status: 404 });
 								break;
@@ -413,6 +420,12 @@ export default {
 						}
 					}
 				} else {
+					let destination_exists = await bucket.head(destination);
+					if (dont_overwrite && destination_exists) {
+						response = new Response('Precondition Failed', { status: 412 });
+						break;
+					}
+
 					let src = await bucket.get(resource_path);
 					if (src === null) {
 						response = new Response('Not Found', { status: 404 });
