@@ -74,7 +74,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 		getcontenttype: object.httpMetadata?.contentType,
 		getetag: object.etag,
 		getlastmodified: object.uploaded.toUTCString(),
-		resourcetype: object.key.endsWith('/') ? '<collection />' : '',
+		resourcetype: object.customMetadata?.resourcetype ?? '',
 	};
 }
 
@@ -111,12 +111,13 @@ export default {
 					let r2_objects = await bucket.list({
 						prefix: resource_path,
 						delimiter: '/',
+						include: ['httpMetadata', 'customMetadata'],
 					});
 					let page = '';
-					for (let dirname of r2_objects.delimitedPrefixes) {
-						page += `<a href="${dirname}">${dirname}</a><br>`;
-					}
-					for (let object of r2_objects.objects.filter(object => !object.key.endsWith('/'))) {
+					// for (let dirname of r2_objects.delimitedPrefixes) {
+					// 	page += `<a href="${dirname}">${dirname}</a><br>`;
+					// }
+					for (let object of r2_objects.objects) {
 						page += `<a href="${object.key}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
 					}
 					response = new Response(page, { status: 200, headers: { 'Content-Type': 'text/html' } });
@@ -203,7 +204,7 @@ export default {
 					break;
 				}
 
-				resource_path = resource_path.endsWith('/') ? resource_path : resource_path + '/';
+				resource_path = resource_path.endsWith('/') ? resource_path.slice(0, -1) : resource_path;
 
 				// Check if the resource already exists
 				if (await bucket.head(resource_path)) {
@@ -212,14 +213,17 @@ export default {
 				}
 
 				// Check if the parent directory exists
-				let parent_dir = resource_path.split('/').slice(0, -2).join("/") + '/';
+				let parent_dir = resource_path.split('/').slice(0, -2).join("/");
 
-				if (parent_dir !== '/' && !await bucket.head(parent_dir)) {
+				if (parent_dir !== '' && !await bucket.head(parent_dir)) {
 					response = new Response('Conflict', { status: 409 });
 					break;
 				}
 
-				await bucket.put(resource_path, new Uint8Array(), { httpMetadata: request.headers });
+				await bucket.put(resource_path, new Uint8Array(), {
+					httpMetadata: request.headers,
+					customMetadata: { resourcetype: '<collection />' }
+				});
 				response = new Response('', { status: 201 });
 			}
 				break;
@@ -289,22 +293,23 @@ export default {
 								prefix: resource_path,
 								delimiter: '/',
 								cursor: cursor,
+								include: ['httpMetadata', 'customMetadata'],
 							});
 
-							for (let dirname of r2_objects.delimitedPrefixes) {
-								page += `
-	<response>
-		<href>${dirname}</href>
-		<propstat>
-			<prop>
-				<resourcetype><collection /></resourcetype>
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`;
-							}
+							// 						for (let dirname of r2_objects.delimitedPrefixes) {
+							// 							page += `
+							// <response>
+							// 	<href>${dirname}</href>
+							// 	<propstat>
+							// 		<prop>
+							// 			<resourcetype><collection /></resourcetype>
+							// 		</prop>
+							// 		<status>HTTP/1.1 200 OK</status>
+							// 	</propstat>
+							// </response>`;
+							// 						}
 
-							for (let object of r2_objects.objects.filter(object => !object.key.endsWith('/'))) {
+							for (let object of r2_objects.objects) {
 								page += `
 	<response>
 		<href>${object.key}</href>
