@@ -114,11 +114,8 @@ export default {
 						include: ['httpMetadata', 'customMetadata'],
 					});
 					let page = '';
-					// for (let dirname of r2_objects.delimitedPrefixes) {
-					// 	page += `<a href="${dirname}">${dirname}</a><br>`;
-					// }
-					for (let object of r2_objects.objects) {
-						page += `<a href="${object.key}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
+					for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
+						page += `<a href="/${object.key}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
 					}
 					response = new Response(page, { status: 200, headers: { 'Content-Type': 'text/html' } });
 				} else {
@@ -170,10 +167,13 @@ export default {
 				}
 
 				// Check if the parent directory exists
-				let dirpath = resource_path.split('/').slice(0, -1).join('/') + '/';
-				let dir = await bucket.head(dirpath);
-				if (!dir || dir.customMetadata?.resourcetype !== '<collection />') {
-					response = new Response('Conflict', { status: 409 });
+				let dirpath = resource_path.split('/').slice(0, -1).join('/');
+				if (dirpath !== '') {
+					let dir = await bucket.head(dirpath);
+					if (!(dir && dir.customMetadata?.resourcetype === '<collection />')) {
+						response = new Response('Conflict', { status: 409 });
+						break;
+					}
 				}
 
 				let body = await request.arrayBuffer();
@@ -185,16 +185,44 @@ export default {
 			}
 				break;
 			case 'DELETE': {
-				if (resource_path.endsWith('/')) {
-					let r2_objects = await bucket.list({
-						prefix: resource_path,
-					});
-					await Promise.all(r2_objects.objects.map(
-						object => bucket.delete(object.key)
-					));
-				} else {
-					await bucket.delete(resource_path);
+				if (!resource_path.endsWith('/')) {
+					let resource = await bucket.head(resource_path);
+					if (resource === null) {
+						response = new Response('Not Found', { status: 404 });
+						break;
+					} else {
+						if (resource.customMetadata?.resourcetype !== '<collection />') {
+							await bucket.delete(resource_path);
+							response = new Response(null, { status: 204 });
+							break;
+						}
+					}
 				}
+
+				let dirpath = resource_path.slice(0, -1);
+				if (await bucket.head(dirpath) === null) {
+					response = new Response('Not Found', { status: 404 });
+					break;
+				}
+
+				await bucket.delete(dirpath);
+
+				let r2_objects, cursor: string | undefined = undefined;
+				do {
+					r2_objects = await bucket.list({
+						prefix: resource_path,
+						cursor: cursor,
+					});
+					let keys = r2_objects.objects.map(object => object.key);
+					if (keys.length > 0) {
+						await bucket.delete(keys);
+					}
+
+					if (r2_objects.truncated) {
+						cursor = r2_objects.cursor;
+					}
+				} while (r2_objects.truncated);
+
 				response = new Response(null, { status: 204 });
 			}
 				break;
@@ -213,7 +241,7 @@ export default {
 				}
 
 				// Check if the parent directory exists
-				let parent_dir = resource_path.split('/').slice(0, -2).join("/");
+				let parent_dir = resource_path.split('/').slice(0, -1).join("/");
 
 				if (parent_dir !== '' && !await bucket.head(parent_dir)) {
 					response = new Response('Conflict', { status: 409 });
@@ -235,7 +263,7 @@ export default {
 							response = new Response(`<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">
 	<response>
-		<href>${resource_path}</href>
+		<href>/</href>
 		<propstat>
 			<prop>
 				<resourcetype><collection /></resourcetype>
@@ -260,7 +288,7 @@ export default {
 							let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">
 	<response>
-		<href>${resource_path}</href>
+		<href>/${resource_path}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
@@ -296,23 +324,10 @@ export default {
 								include: ['httpMetadata', 'customMetadata'],
 							});
 
-							// 						for (let dirname of r2_objects.delimitedPrefixes) {
-							// 							page += `
-							// <response>
-							// 	<href>${dirname}</href>
-							// 	<propstat>
-							// 		<prop>
-							// 			<resourcetype><collection /></resourcetype>
-							// 		</prop>
-							// 		<status>HTTP/1.1 200 OK</status>
-							// 	</propstat>
-							// </response>`;
-							// 						}
-
-							for (let object of r2_objects.objects) {
+							for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
 								page += `
 	<response>
-		<href>${object.key}</href>
+		<href>/${object.key}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
@@ -424,36 +439,44 @@ export default {
 				}
 				let destination = new URL(destination_header).pathname.slice(1);
 				let destination_exists = await bucket.head(destination);
-				if (destination_exists) {
-					if (overwrite) {
-						await Promise.all((await bucket.list({
-							prefix: destination,
-						})).objects.map(object => bucket.delete(object.key)));
-					} else {
-						response = new Response('Precondition Failed', { status: 412 });
-						break;
-					}
+				if (destination_exists && !overwrite) {
+					response = new Response('Precondition Failed', { status: 412 });
+					break;
 				}
+
+				// TODO delete recursively (if destination is a directory)
+				// await bucket.delete(
+				// 	(await bucket.list({ prefix: destination, delimiter: '/' })).objects.map(object => object.key)
+				// );
+
 				if (resource_path.endsWith('/')) {
 					let depth = request.headers.get('Depth') ?? 'infinity';
 					switch (depth) {
 						case 'infinity': {
-							let r2_objects = await bucket.list({
-								prefix: resource_path,
-							});
-							await Promise.all(r2_objects.objects.map(
-								object => (async () => {
-									let target = destination + object.key.slice(resource_path.length);
-									let src = await bucket.get(object.key);
-									if (src !== null) {
-										await bucket.put(target, src.body, {
-											httpMetadata: object.httpMetadata,
-											customMetadata: object.customMetadata,
-										});
-										await bucket.delete(object.key);
-									}
-								})()
-							));
+							let r2_objects, cursor: string | undefined = undefined;
+							do {
+								r2_objects = await bucket.list({
+									prefix: resource_path,
+									cursor: cursor,
+									include: ['httpMetadata', 'customMetadata'],
+								});
+								await Promise.all(r2_objects.objects.map(
+									object => (async () => {
+										let target = destination + object.key.slice(resource_path.length);
+										let src = await bucket.get(object.key);
+										if (src !== null) {
+											await bucket.put(target, src.body, {
+												httpMetadata: object.httpMetadata,
+												customMetadata: object.customMetadata,
+											});
+											await bucket.delete(object.key);
+										}
+									})()
+								));
+								if (r2_objects.truncated) {
+									cursor = r2_objects.cursor;
+								}
+							} while (r2_objects.truncated)
 							response = new Response('', { status: 201 });
 						}
 							break;
@@ -478,6 +501,7 @@ export default {
 					}
 				}
 			}
+				break;
 			default: {
 				response = new Response('Method Not Allowed', {
 					status: 405,
