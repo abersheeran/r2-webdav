@@ -281,34 +281,39 @@ export default {
 							break;
 						}
 
-						let object = await bucket.get(resource_path);
-						if (object === null && !resource_path.endsWith('/')) {
+						let object = await bucket.head(resource_path);
+						if (object === null && resource_path.endsWith('/')) {
+							object = await bucket.head(resource_path.slice(0, -1));
+						}
+
+						if (object === null) {
 							response = new Response('Not Found', { status: 404 });
-						} else {
-							let page = `<?xml version="1.0" encoding="utf-8"?>
+							break;
+						}
+
+						let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">
 	<response>
 		<href>/${resource_path}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-									.filter(([_, value]) => value !== undefined)
-									.map(([key, value]) => `<${key}>${value}</${key}>`)
-									.join('\n')
-								}
+								.filter(([_, value]) => value !== undefined)
+								.map(([key, value]) => `<${key}>${value}</${key}>`)
+								.join('\n')
+							}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>
 </multistatus>
 `;
-							response = new Response(page, {
-								status: 207,
-								headers: {
-									'Content-Type': 'text/xml',
-								},
-							});
-						}
+						response = new Response(page, {
+							status: 207,
+							headers: {
+								'Content-Type': 'text/xml',
+							},
+						});
 					}
 						break;
 					case '1': {
@@ -323,6 +328,18 @@ export default {
 								cursor: cursor,
 								include: ['httpMetadata', 'customMetadata'],
 							});
+
+							if (r2_objects.objects.length === 1) {
+								let object = r2_objects.objects[0];
+								// When the resource is a collection
+								if (object.key === resource_path && object.customMetadata?.resourcetype === '<collection />') {
+									resource_path = resource_path.endsWith('/') ? resource_path : resource_path + '/';
+									if (r2_objects.truncated) {
+										delete r2_objects.cursor
+									}
+									r2_objects.truncated = true;
+								}
+							}
 
 							for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
 								page += `
