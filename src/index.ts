@@ -114,8 +114,10 @@ export default {
 						include: ['httpMetadata', 'customMetadata'],
 					});
 					let page = '';
+					if (resource_path !== '') page += `<a href="../">..</a><br>`;
 					for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
-						page += `<a href="/${object.key}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
+						let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+						page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
 					}
 					response = new Response(page, { status: 200, headers: { 'Content-Type': 'text/html' } });
 				} else {
@@ -342,9 +344,10 @@ export default {
 							}
 
 							for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
+								let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 								page += `
 	<response>
-		<href>/${object.key}</href>
+		<href>${href}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
