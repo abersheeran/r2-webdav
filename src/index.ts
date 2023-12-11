@@ -319,41 +319,43 @@ export default {
 					}
 						break;
 					case '1': {
-						let object = await bucket.head(resource_path);
-						if (object === null && resource_path.endsWith('/')) {
-							object = await bucket.head(resource_path.slice(0, -1));
-						}
+						if (resource_path !== "") {
+							let object = await bucket.head(resource_path);
+							if (object === null && resource_path.endsWith('/')) {
+								object = await bucket.head(resource_path.slice(0, -1));
+							}
 
-						if (object === null) {
-							response = new Response('Not Found', { status: 404 });
-							break;
-						}
+							if (object === null) {
+								response = new Response('Not Found', { status: 404 });
+								break;
+							}
 
-						if (object.customMetadata?.resourcetype !== '<collection />') {
-							let page = `<?xml version="1.0" encoding="utf-8"?>
-<multistatus xmlns="DAV:">
-	<response>
-		<href>/${resource_path}</href>
-		<propstat>
-			<prop>
-				${Object.entries(fromR2Object(object))
-									.filter(([_, value]) => value !== undefined)
-									.map(([key, value]) => `<${key}>${value}</${key}>`)
-									.join('\n				')
-								}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>
-</multistatus>
-`;
-							response = new Response(page, {
-								status: 207,
-								headers: {
-									'Content-Type': 'text/xml',
-								},
-							});
-							break;
+							if (object.customMetadata?.resourcetype !== '<collection />') {
+								let page = `<?xml version="1.0" encoding="utf-8"?>
+	<multistatus xmlns="DAV:">
+		<response>
+			<href>/${resource_path}</href>
+			<propstat>
+				<prop>
+					${Object.entries(fromR2Object(object))
+										.filter(([_, value]) => value !== undefined)
+										.map(([key, value]) => `<${key}>${value}</${key}>`)
+										.join('\n				')
+									}
+				</prop>
+				<status>HTTP/1.1 200 OK</status>
+			</propstat>
+		</response>
+	</multistatus>
+	`;
+								response = new Response(page, {
+									status: 207,
+									headers: {
+										'Content-Type': 'text/xml',
+									},
+								});
+								break;
+							}
 						}
 
 						let page = `<?xml version="1.0" encoding="utf-8"?>
@@ -362,7 +364,7 @@ export default {
 						let cursor: string | undefined = undefined;
 						do {
 							var r2_objects = await bucket.list({
-								prefix: resource_path.endsWith('/') ? resource_path : resource_path + '/',
+								prefix: resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/',
 								delimiter: '/',
 								cursor: cursor,
 								include: ['httpMetadata', 'customMetadata'],
@@ -400,41 +402,43 @@ export default {
 					}
 						break;
 					case 'infinity': {
-						let object = await bucket.head(resource_path);
-						if (object === null && resource_path.endsWith('/')) {
-							object = await bucket.head(resource_path.slice(0, -1));
-						}
+						if (resource_path !== "") {
+							let object = await bucket.head(resource_path);
+							if (object === null && resource_path.endsWith('/')) {
+								object = await bucket.head(resource_path.slice(0, -1));
+							}
 
-						if (object === null) {
-							response = new Response('Not Found', { status: 404 });
-							break;
-						}
+							if (object === null) {
+								response = new Response('Not Found', { status: 404 });
+								break;
+							}
 
-						if (object.customMetadata?.resourcetype !== '<collection />') {
-							let page = `<?xml version="1.0" encoding="utf-8"?>
+							if (object.customMetadata?.resourcetype !== '<collection />') {
+								let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">
 	<response>
 		<href>/${resource_path}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-									.filter(([_, value]) => value !== undefined)
-									.map(([key, value]) => `<${key}>${value}</${key}>`)
-									.join('\n				')
-								}
+										.filter(([_, value]) => value !== undefined)
+										.map(([key, value]) => `<${key}>${value}</${key}>`)
+										.join('\n				')
+									}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>
 </multistatus>
 `;
-							response = new Response(page, {
-								status: 207,
-								headers: {
-									'Content-Type': 'text/xml',
-								},
-							});
-							break;
+								response = new Response(page, {
+									status: 207,
+									headers: {
+										'Content-Type': 'text/xml',
+									},
+								});
+								break;
+							}
 						}
 
 						let page = `<?xml version="1.0" encoding="utf-8"?>
@@ -443,7 +447,7 @@ export default {
 						let cursor: string | undefined = undefined;
 						do {
 							var r2_objects = await bucket.list({
-								prefix: resource_path.endsWith('/') ? resource_path : resource_path + '/',
+								prefix: resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/',
 								cursor: cursor,
 								include: ['httpMetadata', 'customMetadata'],
 							});
