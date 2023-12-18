@@ -207,6 +207,23 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 	let resource_path = make_resource_path(request);
 	resource_path = resource_path.endsWith('/') ? resource_path.slice(0, -1) : resource_path;
 
+	if (resource_path === '') {
+		let r2_objects, cursor: string | undefined = undefined;
+		do {
+			r2_objects = await bucket.list({ cursor: cursor });
+			let keys = r2_objects.objects.map(object => object.key);
+			if (keys.length > 0) {
+				await bucket.delete(keys);
+			}
+
+			if (r2_objects.truncated) {
+				cursor = r2_objects.cursor;
+			}
+		} while (r2_objects.truncated);
+
+		return new Response(null, { status: 204 });
+	}
+
 	let resource = await bucket.head(resource_path);
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
@@ -236,16 +253,16 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 }
 
 async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
-
 	if (request.body) {
 		return new Response('Unsupported Media Type', { status: 415 });
 	}
 
+	let resource_path = make_resource_path(request);
 	resource_path = resource_path.endsWith('/') ? resource_path.slice(0, -1) : resource_path;
 
 	// Check if the resource already exists
-	if (await bucket.head(resource_path)) {
+	let resource = await bucket.head(resource_path);
+	if (resource !== null) {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
@@ -491,7 +508,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 		return new Response('Not Found', { status: 404 });
 	}
 
-	let is_dir = resource_path.endsWith('/') || resource?.customMetadata?.resourcetype === '<collection />';
+	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
 
 	if (is_dir) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
@@ -500,6 +517,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 				let prefix = resource_path.endsWith("/") ? resource_path : resource_path + "/";
 				const copy = async (object: R2Object) => {
 					let target = destination + "/" + object.key.slice(prefix.length);
+					target = target.endsWith("/") ? target.slice(0, -1) : target;
 					let src = await bucket.get(object.key);
 					if (src !== null) {
 						await bucket.put(target, src.body, {
