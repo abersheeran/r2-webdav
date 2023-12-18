@@ -296,7 +296,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			${Object.entries(fromR2Object(null))
 				.filter(([_, value]) => value !== undefined)
 				.map(([key, value]) => `<${key}>${value}</${key}>`)
-				.join('\n')}
+				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
@@ -317,7 +317,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			${Object.entries(fromR2Object(object))
 				.filter(([_, value]) => value !== undefined)
 				.map(([key, value]) => `<${key}>${value}</${key}>`)
-				.join('\n')}
+				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
@@ -340,8 +340,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				${Object.entries(fromR2Object(object))
 							.filter(([_, value]) => value !== undefined)
 							.map(([key, value]) => `<${key}>${value}</${key}>`)
-							.join('\n				')
-						}
+							.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
