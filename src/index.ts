@@ -205,30 +205,21 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 
 async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
+	resource_path = resource_path.endsWith('/') ? resource_path.slice(0, -1) : resource_path;
 
-	if (!resource_path.endsWith('/')) {
-		let resource = await bucket.head(resource_path);
-		if (resource === null) {
-			return new Response('Not Found', { status: 404 });
-		} else {
-			if (resource.customMetadata?.resourcetype !== '<collection />') {
-				await bucket.delete(resource_path);
-				return new Response(null, { status: 204 });
-			}
-		}
-	}
-
-	let dirpath = resource_path.slice(0, -1);
-	if (await bucket.head(dirpath) === null) {
+	let resource = await bucket.head(resource_path);
+	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
 	}
-
-	await bucket.delete(dirpath);
+	await bucket.delete(resource_path);
+	if (resource.customMetadata?.resourcetype !== '<collection />') {
+		return new Response(null, { status: 204 });
+	}
 
 	let r2_objects, cursor: string | undefined = undefined;
 	do {
 		r2_objects = await bucket.list({
-			prefix: resource_path,
+			prefix: resource_path + "/",
 			cursor: cursor,
 		});
 		let keys = r2_objects.objects.map(object => object.key);
@@ -481,6 +472,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 		return new Response('Bad Request', { status: 400 });
 	}
 	let destination = new URL(destination_header).pathname.slice(1);
+	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
 
 	// Check if the parent directory exists
 	let destination_parent = destination.split('/').slice(0, destination.endsWith('/') ? -2 : -1).join('/');
@@ -488,32 +480,47 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 		return new Response('Conflict', { status: 409 });
 	}
 
-	if (resource_path.endsWith('/')) {
+	// Check if the destination already exists
+	let destination_exists = await bucket.head(destination);
+	if (dont_overwrite && destination_exists) {
+		return new Response('Precondition Failed', { status: 412 });
+	}
+
+	let resource = await bucket.head(resource_path.endsWith("/") ? resource_path.slice(0, -1) : resource_path);
+	if (resource === null) {
+		return new Response('Not Found', { status: 404 });
+	}
+
+	let is_dir = resource_path.endsWith('/') || resource?.customMetadata?.resourcetype === '<collection />';
+
+	if (is_dir) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
 			case 'infinity': {
-				let r2_objects = await bucket.list({
-					prefix: resource_path,
-				});
-				if (r2_objects.objects.length === 0) {
-					return new Response('Not Found', { status: 404 });
+				let prefix = resource_path.endsWith("/") ? resource_path : resource_path + "/";
+				const copy = async (object: R2Object) => {
+					let target = destination + "/" + object.key.slice(prefix.length);
+					let src = await bucket.get(object.key);
+					if (src !== null) {
+						await bucket.put(target, src.body, {
+							httpMetadata: object.httpMetadata,
+							customMetadata: object.customMetadata,
+						});
+					}
+				};
+				let promise_array = [copy(resource)];
+				for await (let object of listAll(bucket, prefix, true)) {
+					promise_array.push(copy(object));
 				}
-				await Promise.all(r2_objects.objects.map(
-					object => (async () => {
-						let target = destination + object.key.slice(resource_path.length);
-						let src = await bucket.get(object.key);
-						if (src !== null) {
-							await bucket.put(target, src.body, {
-								httpMetadata: object.httpMetadata,
-								customMetadata: object.customMetadata,
-							});
-						}
-					})()
-				));
-				return new Response('', { status: 201 });
+				await Promise.all(promise_array);
+				if (destination_exists) {
+					return new Response(null, { status: 204 });
+				} else {
+					return new Response('', { status: 201 });
+				}
 			}
 			case '0': {
-				let object = await bucket.get(resource_path.slice(0, -1));
+				let object = await bucket.get(resource.key);
 				if (object === null) {
 					return new Response('Not Found', { status: 404 });
 				}
@@ -521,19 +528,18 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 					httpMetadata: object.httpMetadata,
 					customMetadata: object.customMetadata,
 				});
-				return new Response('', { status: 201 });
+				if (destination_exists) {
+					return new Response(null, { status: 204 });
+				} else {
+					return new Response('', { status: 201 });
+				}
 			}
 			default: {
 				return new Response('Bad Request', { status: 400 });
 			}
 		}
 	} else {
-		let destination_exists = await bucket.head(destination);
-		if (dont_overwrite && destination_exists) {
-			return new Response('Precondition Failed', { status: 412 });
-		}
-
-		let src = await bucket.get(resource_path);
+		let src = await bucket.get(resource.key);
 		if (src === null) {
 			return new Response('Not Found', { status: 404 });
 		}
