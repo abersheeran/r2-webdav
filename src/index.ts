@@ -78,191 +78,188 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	};
 }
 
-export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const { bucket } = env;
 
-		if (request.headers.get('Authorization') !== `Basic ${btoa(`${env.USERNAME}:${env.PASSWORD}`)}`) {
-			return new Response('Unauthorized', {
-				status: 401, headers: {
-					'WWW-Authenticate': 'Basic realm="webdav"',
+function make_resource_path(request: Request): string {
+	return new URL(request.url).pathname.slice(1)
+}
+
+async function handle_options(request: Request, bucket: R2Bucket): Promise<Response> {
+	return new Response(null, {
+		status: 204,
+		headers: {
+			'DAV': DAV_CLASS,
+			'Allow': SUPPORT_METHODS.join(', '),
+		}
+	});
+}
+
+async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
+	let response = await handle_get(request, bucket);
+	return new Response(null, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
+}
+
+async function handle_get(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+
+	if (request.url.endsWith('/')) {
+		let r2_objects = await bucket.list({
+			prefix: resource_path,
+			delimiter: '/',
+			include: ['httpMetadata', 'customMetadata'],
+		});
+		let page = '';
+		if (resource_path !== '') page += `<a href="../">..</a><br>`;
+		for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
+			let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
+		}
+		return new Response(page, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+	} else {
+		let object = await bucket.get(resource_path, {
+			onlyIf: request.headers,
+			range: request.headers,
+		});
+
+		let isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody => {
+			return 'body' in object;
+		}
+
+		if (object === null) {
+			return new Response('Not Found', { status: 404 });
+		} else if (!isR2ObjectBody(object)) {
+			return new Response("Precondition Failed", { status: 412 });
+		} else {
+			return new Response(object.body, {
+				status: object.range ? 206 : 200,
+				headers: {
+					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+					// TODO: Content-Length, Content-Range
+
+					...(object.httpMetadata?.contentDisposition ? {
+						'Content-Disposition': object.httpMetadata.contentDisposition,
+					} : {}),
+					...(object.httpMetadata?.contentEncoding ? {
+						'Content-Encoding': object.httpMetadata.contentEncoding,
+					} : {}),
+					...(object.httpMetadata?.contentLanguage ? {
+						'Content-Language': object.httpMetadata.contentLanguage,
+					} : {}),
+					...(object.httpMetadata?.cacheControl ? {
+						'Cache-Control': object.httpMetadata.cacheControl,
+					} : {}),
+					...(object.httpMetadata?.cacheExpiry ? {
+						'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+					} : {}),
 				}
 			});
 		}
+	}
+}
 
-		let response: Response;
+async function handle_put(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
 
-		let resource_path = new URL(request.url).pathname.slice(1);
+	if (resource_path.endsWith('/')) {
+		return new Response('Method Not Allowed', { status: 405 });
+	}
 
-		switch (request.method) {
-			case 'OPTIONS': {
-				response = new Response(null, {
-					status: 204,
-					headers: {
-						'DAV': DAV_CLASS,
-						'Allow': SUPPORT_METHODS.join(', '),
-					}
-				});
+	// Check if the parent directory exists
+	let dirpath = resource_path.split('/').slice(0, -1).join('/');
+	if (dirpath !== '') {
+		let dir = await bucket.head(dirpath);
+		if (!(dir && dir.customMetadata?.resourcetype === '<collection />')) {
+			return new Response('Conflict', { status: 409 });
+		}
+	}
+
+	let body = await request.arrayBuffer();
+	await bucket.put(resource_path, body, {
+		onlyIf: request.headers,
+		httpMetadata: request.headers,
+	});
+	return new Response('', { status: 201 });
+}
+
+async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+
+	if (!resource_path.endsWith('/')) {
+		let resource = await bucket.head(resource_path);
+		if (resource === null) {
+			return new Response('Not Found', { status: 404 });
+		} else {
+			if (resource.customMetadata?.resourcetype !== '<collection />') {
+				await bucket.delete(resource_path);
+				return new Response(null, { status: 204 });
 			}
-				break;
-			case 'HEAD':
-			case 'GET': {
-				if (request.url.endsWith('/')) {
-					let r2_objects = await bucket.list({
-						prefix: resource_path,
-						delimiter: '/',
-						include: ['httpMetadata', 'customMetadata'],
-					});
-					let page = '';
-					if (resource_path !== '') page += `<a href="../">..</a><br>`;
-					for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
-						let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-						page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
-					}
-					response = new Response(page, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-				} else {
-					let object = await bucket.get(resource_path, {
-						onlyIf: request.headers,
-						range: request.headers,
-					});
+		}
+	}
 
-					let isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody => {
-						return 'body' in object;
-					}
+	let dirpath = resource_path.slice(0, -1);
+	if (await bucket.head(dirpath) === null) {
+		return new Response('Not Found', { status: 404 });
+	}
 
-					if (object === null) {
-						response = new Response('Not Found', { status: 404 });
-					} else if (!isR2ObjectBody(object)) {
-						response = new Response("Precondition Failed", { status: 412 });
-					} else {
-						response = new Response(object.body, {
-							status: object.range ? 206 : 200,
-							headers: {
-								'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
-								// TODO: Content-Length, Content-Range
+	await bucket.delete(dirpath);
 
-								...(object.httpMetadata?.contentDisposition ? {
-									'Content-Disposition': object.httpMetadata.contentDisposition,
-								} : {}),
-								...(object.httpMetadata?.contentEncoding ? {
-									'Content-Encoding': object.httpMetadata.contentEncoding,
-								} : {}),
-								...(object.httpMetadata?.contentLanguage ? {
-									'Content-Language': object.httpMetadata.contentLanguage,
-								} : {}),
-								...(object.httpMetadata?.cacheControl ? {
-									'Cache-Control': object.httpMetadata.cacheControl,
-								} : {}),
-								...(object.httpMetadata?.cacheExpiry ? {
-									'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-								} : {}),
-							}
-						});
-					}
-				}
-			}
-				break;
-			case 'PUT': {
-				if (resource_path.endsWith('/')) {
-					response = new Response('Method Not Allowed', { status: 405 });
-					break;
-				}
+	let r2_objects, cursor: string | undefined = undefined;
+	do {
+		r2_objects = await bucket.list({
+			prefix: resource_path,
+			cursor: cursor,
+		});
+		let keys = r2_objects.objects.map(object => object.key);
+		if (keys.length > 0) {
+			await bucket.delete(keys);
+		}
 
-				// Check if the parent directory exists
-				let dirpath = resource_path.split('/').slice(0, -1).join('/');
-				if (dirpath !== '') {
-					let dir = await bucket.head(dirpath);
-					if (!(dir && dir.customMetadata?.resourcetype === '<collection />')) {
-						response = new Response('Conflict', { status: 409 });
-						break;
-					}
-				}
+		if (r2_objects.truncated) {
+			cursor = r2_objects.cursor;
+		}
+	} while (r2_objects.truncated);
 
-				let body = await request.arrayBuffer();
-				await bucket.put(resource_path, body, {
-					onlyIf: request.headers,
-					httpMetadata: request.headers,
-				});
-				response = new Response('', { status: 201 });
-			}
-				break;
-			case 'DELETE': {
-				if (!resource_path.endsWith('/')) {
-					let resource = await bucket.head(resource_path);
-					if (resource === null) {
-						response = new Response('Not Found', { status: 404 });
-						break;
-					} else {
-						if (resource.customMetadata?.resourcetype !== '<collection />') {
-							await bucket.delete(resource_path);
-							response = new Response(null, { status: 204 });
-							break;
-						}
-					}
-				}
+	return new Response(null, { status: 204 });
+}
 
-				let dirpath = resource_path.slice(0, -1);
-				if (await bucket.head(dirpath) === null) {
-					response = new Response('Not Found', { status: 404 });
-					break;
-				}
+async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
 
-				await bucket.delete(dirpath);
+	if (request.body) {
+		return new Response('Unsupported Media Type', { status: 415 });
+	}
 
-				let r2_objects, cursor: string | undefined = undefined;
-				do {
-					r2_objects = await bucket.list({
-						prefix: resource_path,
-						cursor: cursor,
-					});
-					let keys = r2_objects.objects.map(object => object.key);
-					if (keys.length > 0) {
-						await bucket.delete(keys);
-					}
+	resource_path = resource_path.endsWith('/') ? resource_path.slice(0, -1) : resource_path;
 
-					if (r2_objects.truncated) {
-						cursor = r2_objects.cursor;
-					}
-				} while (r2_objects.truncated);
+	// Check if the resource already exists
+	if (await bucket.head(resource_path)) {
+		return new Response('Method Not Allowed', { status: 405 });
+	}
 
-				response = new Response(null, { status: 204 });
-			}
-				break;
-			case 'MKCOL': {
-				if (request.body) {
-					response = new Response('Unsupported Media Type', { status: 415 });
-					break;
-				}
+	// Check if the parent directory exists
+	let parent_dir = resource_path.split('/').slice(0, -1).join("/");
 
-				resource_path = resource_path.endsWith('/') ? resource_path.slice(0, -1) : resource_path;
+	if (parent_dir !== '' && !await bucket.head(parent_dir)) {
+		return new Response('Conflict', { status: 409 });
+	}
 
-				// Check if the resource already exists
-				if (await bucket.head(resource_path)) {
-					response = new Response('Method Not Allowed', { status: 405 });
-					break;
-				}
+	await bucket.put(resource_path, new Uint8Array(), {
+		httpMetadata: request.headers,
+		customMetadata: { resourcetype: '<collection />' }
+	});
+	return new Response('', { status: 201 });
+}
 
-				// Check if the parent directory exists
-				let parent_dir = resource_path.split('/').slice(0, -1).join("/");
-
-				if (parent_dir !== '' && !await bucket.head(parent_dir)) {
-					response = new Response('Conflict', { status: 409 });
-					break;
-				}
-
-				await bucket.put(resource_path, new Uint8Array(), {
-					httpMetadata: request.headers,
-					customMetadata: { resourcetype: '<collection />' }
-				});
-				response = new Response('', { status: 201 });
-			}
-				break;
-			case 'PROPFIND': {
-				let depth = request.headers.get('Depth') ?? 'infinity';
-				switch (depth) {
-					case '0': {
-						if (resource_path === "") {
-							response = new Response(`<?xml version="1.0" encoding="utf-8"?>
+async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+	let depth = request.headers.get('Depth') ?? 'infinity';
+	switch (depth) {
+		case '0': {
+			if (resource_path === "") {
+				return new Response(`<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">
 	<response>
 		<href>/</href>
@@ -275,393 +272,410 @@ export default {
 	</response>
 </multistatus>
 							`, {
-								status: 207,
-								headers: {
-									'Content-Type': 'text/xml',
-								},
-							});
-							break;
-						}
+					status: 207,
+					headers: {
+						'Content-Type': 'text/xml',
+					},
+				});
+			}
 
-						let object = await bucket.head(resource_path);
-						if (object === null && resource_path.endsWith('/')) {
-							object = await bucket.head(resource_path.slice(0, -1));
-						}
+			let object = await bucket.head(resource_path);
+			if (object === null && resource_path.endsWith('/')) {
+				object = await bucket.head(resource_path.slice(0, -1));
+			}
 
-						if (object === null) {
-							response = new Response('Not Found', { status: 404 });
-							break;
-						}
+			if (object === null) {
+				return new Response('Not Found', { status: 404 });
+			}
 
-						let page = `<?xml version="1.0" encoding="utf-8"?>
+			let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">
 	<response>
 		<href>/${resource_path}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-								.filter(([_, value]) => value !== undefined)
-								.map(([key, value]) => `<${key}>${value}</${key}>`)
-								.join('\n')
-							}
+					.filter(([_, value]) => value !== undefined)
+					.map(([key, value]) => `<${key}>${value}</${key}>`)
+					.join('\n')
+				}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>
 </multistatus>
 `;
-						response = new Response(page, {
-							status: 207,
-							headers: {
-								'Content-Type': 'text/xml',
-							},
-						});
-					}
-						break;
-					case '1': {
-						if (resource_path !== "") {
-							let object = await bucket.head(resource_path);
-							if (object === null && resource_path.endsWith('/')) {
-								object = await bucket.head(resource_path.slice(0, -1));
-							}
+			return new Response(page, {
+				status: 207,
+				headers: {
+					'Content-Type': 'text/xml',
+				},
+			});
+		}
+		case '1': {
+			if (resource_path !== "") {
+				let object = await bucket.head(resource_path);
+				if (object === null && resource_path.endsWith('/')) {
+					object = await bucket.head(resource_path.slice(0, -1));
+				}
 
-							if (object === null) {
-								response = new Response('Not Found', { status: 404 });
-								break;
-							}
+				if (object === null) {
+					return new Response('Not Found', { status: 404 });
+				}
 
-							if (object.customMetadata?.resourcetype !== '<collection />') {
-								let page = `<?xml version="1.0" encoding="utf-8"?>
+				if (object.customMetadata?.resourcetype !== '<collection />') {
+					let page = `<?xml version="1.0" encoding="utf-8"?>
 	<multistatus xmlns="DAV:">
 		<response>
 			<href>/${resource_path}</href>
 			<propstat>
 				<prop>
 					${Object.entries(fromR2Object(object))
-										.filter(([_, value]) => value !== undefined)
-										.map(([key, value]) => `<${key}>${value}</${key}>`)
-										.join('\n				')
-									}
+							.filter(([_, value]) => value !== undefined)
+							.map(([key, value]) => `<${key}>${value}</${key}>`)
+							.join('\n				')
+						}
 				</prop>
 				<status>HTTP/1.1 200 OK</status>
 			</propstat>
 		</response>
 	</multistatus>
 	`;
-								response = new Response(page, {
-									status: 207,
-									headers: {
-										'Content-Type': 'text/xml',
-									},
-								});
-								break;
-							}
-						}
+					return new Response(page, {
+						status: 207,
+						headers: {
+							'Content-Type': 'text/xml',
+						},
+					});
+				}
+			}
 
-						let page = `<?xml version="1.0" encoding="utf-8"?>
+			let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-						let cursor: string | undefined = undefined;
-						do {
-							var r2_objects = await bucket.list({
-								prefix: resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/',
-								delimiter: '/',
-								cursor: cursor,
-								include: ['httpMetadata', 'customMetadata'],
-							});
+			let cursor: string | undefined = undefined;
+			do {
+				var r2_objects = await bucket.list({
+					prefix: resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/',
+					delimiter: '/',
+					cursor: cursor,
+					include: ['httpMetadata', 'customMetadata'],
+				});
 
-							for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
-								let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-								page += `
+				for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
+					let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+					page += `
 	<response>
 		<href>${href}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-										.filter(([_, value]) => value !== undefined)
-										.map(([key, value]) => `<${key}>${value}</${key}>`)
-										.join('\n				')
-									}
+							.filter(([_, value]) => value !== undefined)
+							.map(([key, value]) => `<${key}>${value}</${key}>`)
+							.join('\n				')
+						}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>`;
-							}
+				}
 
-							if (r2_objects.truncated) {
-								cursor = r2_objects.cursor;
-							}
-						} while (r2_objects.truncated)
-						page += '\n</multistatus>\n';
-						response = new Response(page, {
-							status: 207,
-							headers: {
-								'Content-Type': 'text/xml',
-							},
-						});
-					}
-						break;
-					case 'infinity': {
-						if (resource_path !== "") {
-							let object = await bucket.head(resource_path);
-							if (object === null && resource_path.endsWith('/')) {
-								object = await bucket.head(resource_path.slice(0, -1));
-							}
+				if (r2_objects.truncated) {
+					cursor = r2_objects.cursor;
+				}
+			} while (r2_objects.truncated)
+			page += '\n</multistatus>\n';
+			return new Response(page, {
+				status: 207,
+				headers: {
+					'Content-Type': 'text/xml',
+				},
+			});
+		}
+		case 'infinity': {
+			if (resource_path !== "") {
+				let object = await bucket.head(resource_path);
+				if (object === null && resource_path.endsWith('/')) {
+					object = await bucket.head(resource_path.slice(0, -1));
+				}
 
-							if (object === null) {
-								response = new Response('Not Found', { status: 404 });
-								break;
-							}
+				if (object === null) {
+					return new Response('Not Found', { status: 404 });
+				}
 
-							if (object.customMetadata?.resourcetype !== '<collection />') {
-								let page = `<?xml version="1.0" encoding="utf-8"?>
+				if (object.customMetadata?.resourcetype !== '<collection />') {
+					let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">
 	<response>
 		<href>/${resource_path}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-										.filter(([_, value]) => value !== undefined)
-										.map(([key, value]) => `<${key}>${value}</${key}>`)
-										.join('\n				')
-									}
+							.filter(([_, value]) => value !== undefined)
+							.map(([key, value]) => `<${key}>${value}</${key}>`)
+							.join('\n				')
+						}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>
 </multistatus>
 `;
-								response = new Response(page, {
-									status: 207,
-									headers: {
-										'Content-Type': 'text/xml',
-									},
-								});
-								break;
-							}
-						}
+					return new Response(page, {
+						status: 207,
+						headers: {
+							'Content-Type': 'text/xml',
+						},
+					});
+				}
+			}
 
-						let page = `<?xml version="1.0" encoding="utf-8"?>
+			let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-						let cursor: string | undefined = undefined;
-						do {
-							var r2_objects = await bucket.list({
-								prefix: resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/',
-								cursor: cursor,
-								include: ['httpMetadata', 'customMetadata'],
-							});
+			let cursor: string | undefined = undefined;
+			do {
+				var r2_objects = await bucket.list({
+					prefix: resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/',
+					cursor: cursor,
+					include: ['httpMetadata', 'customMetadata'],
+				});
 
-							for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
-								let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-								page += `
+				for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
+					let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+					page += `
 	<response>
 		<href>${href}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-										.filter(([_, value]) => value !== undefined)
-										.map(([key, value]) => `<${key}>${value}</${key}>`)
-										.join('\n				')
-									}
+							.filter(([_, value]) => value !== undefined)
+							.map(([key, value]) => `<${key}>${value}</${key}>`)
+							.join('\n				')
+						}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>`;
-							}
-
-							if (r2_objects.truncated) {
-								cursor = r2_objects.cursor;
-							}
-						} while (r2_objects.truncated);
-						page += '\n</multistatus>\n';
-						response = new Response(page, {
-							status: 207,
-							headers: {
-								'Content-Type': 'text/xml',
-							},
-						});
-					}
-						break;
-					default: {
-						response = new Response('Forbidden', { status: 403 });
-					}
-				}
-			}
-				break;
-			case 'COPY': {
-				let dont_overwrite = request.headers.get('Overwrite') === 'F';
-				let destination_header = request.headers.get('Destination');
-				if (destination_header === null) {
-					response = new Response('Bad Request', { status: 400 });
-					break;
-				}
-				let destination = new URL(destination_header).pathname.slice(1);
-
-				// Check if the parent directory exists
-				let destination_parent = destination.split('/').slice(0, destination.endsWith('/') ? -2 : -1).join('/');
-				if (destination_parent !== '' && !await bucket.head(destination_parent)) {
-					response = new Response('Conflict', { status: 409 });
-					break;
 				}
 
-				if (resource_path.endsWith('/')) {
-					let depth = request.headers.get('Depth') ?? 'infinity';
-					switch (depth) {
-						case 'infinity': {
-							let r2_objects = await bucket.list({
-								prefix: resource_path,
-							});
-							if (r2_objects.objects.length === 0) {
-								response = new Response('Not Found', { status: 404 });
-								break;
-							}
-							await Promise.all(r2_objects.objects.map(
-								object => (async () => {
-									let target = destination + object.key.slice(resource_path.length);
-									let src = await bucket.get(object.key);
-									if (src !== null) {
-										await bucket.put(target, src.body, {
-											httpMetadata: object.httpMetadata,
-											customMetadata: object.customMetadata,
-										});
-									}
-								})()
-							));
-							response = new Response('', { status: 201 });
-						}
-							break;
-						case '0': {
-							let object = await bucket.get(resource_path.slice(0, -1));
-							if (object === null) {
-								response = new Response('Not Found', { status: 404 });
-								break;
-							}
-							await bucket.put(destination, object.body, {
+				if (r2_objects.truncated) {
+					cursor = r2_objects.cursor;
+				}
+			} while (r2_objects.truncated);
+			page += '\n</multistatus>\n';
+			return new Response(page, {
+				status: 207,
+				headers: {
+					'Content-Type': 'text/xml',
+				},
+			});
+		}
+		default: {
+			return new Response('Forbidden', { status: 403 });
+		}
+	}
+}
+
+async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+	let dont_overwrite = request.headers.get('Overwrite') === 'F';
+	let destination_header = request.headers.get('Destination');
+	if (destination_header === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
+	let destination = new URL(destination_header).pathname.slice(1);
+
+	// Check if the parent directory exists
+	let destination_parent = destination.split('/').slice(0, destination.endsWith('/') ? -2 : -1).join('/');
+	if (destination_parent !== '' && !await bucket.head(destination_parent)) {
+		return new Response('Conflict', { status: 409 });
+	}
+
+	if (resource_path.endsWith('/')) {
+		let depth = request.headers.get('Depth') ?? 'infinity';
+		switch (depth) {
+			case 'infinity': {
+				let r2_objects = await bucket.list({
+					prefix: resource_path,
+				});
+				if (r2_objects.objects.length === 0) {
+					return new Response('Not Found', { status: 404 });
+				}
+				await Promise.all(r2_objects.objects.map(
+					object => (async () => {
+						let target = destination + object.key.slice(resource_path.length);
+						let src = await bucket.get(object.key);
+						if (src !== null) {
+							await bucket.put(target, src.body, {
 								httpMetadata: object.httpMetadata,
 								customMetadata: object.customMetadata,
 							});
-							response = new Response('', { status: 201 });
 						}
-							break;
-						default: {
-							response = new Response('Bad Request', { status: 400 });
-						}
-					}
-				} else {
-					let destination_exists = await bucket.head(destination);
-					if (dont_overwrite && destination_exists) {
-						response = new Response('Precondition Failed', { status: 412 });
-						break;
-					}
-
-					let src = await bucket.get(resource_path);
-					if (src === null) {
-						response = new Response('Not Found', { status: 404 });
-						break;
-					}
-					await bucket.put(destination, src.body, {
-						httpMetadata: src.httpMetadata,
-						customMetadata: src.customMetadata,
-					});
-					if (destination_exists) {
-						response = new Response(null, { status: 204 });
-					} else {
-						response = new Response('', { status: 201 });
-					}
-				}
+					})()
+				));
+				return new Response('', { status: 201 });
 			}
-				break;
-			case 'MOVE': {
-				let overwrite = request.headers.get('Overwrite') === 'T';
-				let destination_header = request.headers.get('Destination');
-				if (destination_header === null) {
-					response = new Response('Bad Request', { status: 400 });
-					break;
+			case '0': {
+				let object = await bucket.get(resource_path.slice(0, -1));
+				if (object === null) {
+					return new Response('Not Found', { status: 404 });
 				}
-				let destination = new URL(destination_header).pathname.slice(1);
-				let destination_exists = await bucket.head(destination);
-				if (destination_exists && !overwrite) {
-					response = new Response('Precondition Failed', { status: 412 });
-					break;
-				}
-
-				// TODO delete recursively (if destination is a directory)
-				// await bucket.delete(
-				// 	(await bucket.list({ prefix: destination, delimiter: '/' })).objects.map(object => object.key)
-				// );
-
-				if (resource_path.endsWith('/')) {
-					let depth = request.headers.get('Depth') ?? 'infinity';
-					switch (depth) {
-						case 'infinity': {
-							let r2_objects, cursor: string | undefined = undefined;
-							do {
-								r2_objects = await bucket.list({
-									prefix: resource_path,
-									cursor: cursor,
-									include: ['httpMetadata', 'customMetadata'],
-								});
-								await Promise.all(r2_objects.objects.map(
-									object => (async () => {
-										let target = destination + object.key.slice(resource_path.length);
-										let src = await bucket.get(object.key);
-										if (src !== null) {
-											await bucket.put(target, src.body, {
-												httpMetadata: object.httpMetadata,
-												customMetadata: object.customMetadata,
-											});
-											await bucket.delete(object.key);
-										}
-									})()
-								));
-								if (r2_objects.truncated) {
-									cursor = r2_objects.cursor;
-								}
-							} while (r2_objects.truncated)
-							response = new Response('', { status: 201 });
-						}
-							break;
-						default: {
-							response = new Response('Bad Request', { status: 400 });
-						}
-					}
-				} else {
-					let src = await bucket.get(resource_path);
-					if (src === null) {
-						response = new Response('Not Found', { status: 404 });
-						break;
-					}
-					await bucket.put(destination, src.body, {
-						httpMetadata: src.httpMetadata,
-						customMetadata: src.customMetadata,
-					});
-					if (destination_exists) {
-						response = new Response(null, { status: 204 });
-					} else {
-						response = new Response('', { status: 201 });
-					}
-				}
-			}
-				break;
-			default: {
-				response = new Response('Method Not Allowed', {
-					status: 405,
-					headers: {
-						'Allow': SUPPORT_METHODS.join(', '),
-						'DAV': DAV_CLASS,
-					}
+				await bucket.put(destination, object.body, {
+					httpMetadata: object.httpMetadata,
+					customMetadata: object.customMetadata,
 				});
+				return new Response('', { status: 201 });
+			}
+			default: {
+				return new Response('Bad Request', { status: 400 });
 			}
 		}
+	} else {
+		let destination_exists = await bucket.head(destination);
+		if (dont_overwrite && destination_exists) {
+			return new Response('Precondition Failed', { status: 412 });
+		}
 
-		if (request.method === 'HEAD') {
-			response = new Response(null, {
-				status: response.status,
-				statusText: response.statusText,
-				headers: response.headers,
+		let src = await bucket.get(resource_path);
+		if (src === null) {
+			return new Response('Not Found', { status: 404 });
+		}
+		await bucket.put(destination, src.body, {
+			httpMetadata: src.httpMetadata,
+			customMetadata: src.customMetadata,
+		});
+		if (destination_exists) {
+			return new Response(null, { status: 204 });
+		} else {
+			return new Response('', { status: 201 });
+		}
+	}
+}
+
+async function handle_move(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+	let overwrite = request.headers.get('Overwrite') === 'T';
+	let destination_header = request.headers.get('Destination');
+	if (destination_header === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
+	let destination = new URL(destination_header).pathname.slice(1);
+	let destination_exists = await bucket.head(destination);
+	if (destination_exists && !overwrite) {
+		return new Response('Precondition Failed', { status: 412 });
+	}
+
+	// TODO delete recursively (if destination is a directory)
+	// await bucket.delete(
+	// 	(await bucket.list({ prefix: destination, delimiter: '/' })).objects.map(object => object.key)
+	// );
+
+	if (resource_path.endsWith('/')) {
+		let depth = request.headers.get('Depth') ?? 'infinity';
+		switch (depth) {
+			case 'infinity': {
+				let r2_objects, cursor: string | undefined = undefined;
+				do {
+					r2_objects = await bucket.list({
+						prefix: resource_path,
+						cursor: cursor,
+						include: ['httpMetadata', 'customMetadata'],
+					});
+					await Promise.all(r2_objects.objects.map(
+						object => (async () => {
+							let target = destination + object.key.slice(resource_path.length);
+							let src = await bucket.get(object.key);
+							if (src !== null) {
+								await bucket.put(target, src.body, {
+									httpMetadata: object.httpMetadata,
+									customMetadata: object.customMetadata,
+								});
+								await bucket.delete(object.key);
+							}
+						})()
+					));
+					if (r2_objects.truncated) {
+						cursor = r2_objects.cursor;
+					}
+				} while (r2_objects.truncated)
+				return new Response('', { status: 201 });
+			}
+			default: {
+				return new Response('Bad Request', { status: 400 });
+			}
+		}
+	} else {
+		let src = await bucket.get(resource_path);
+		if (src === null) {
+			return new Response('Not Found', { status: 404 });
+		}
+		await bucket.put(destination, src.body, {
+			httpMetadata: src.httpMetadata,
+			customMetadata: src.customMetadata,
+		});
+		if (destination_exists) {
+			return new Response(null, { status: 204 });
+		} else {
+			return new Response('', { status: 201 });
+		}
+	}
+}
+
+async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
+	switch (request.method) {
+		case 'OPTIONS': {
+			return await handle_options(request, bucket);
+		}
+		case 'HEAD': {
+			return await handle_head(request, bucket);
+		}
+		case 'GET': {
+			return await handle_get(request, bucket);
+		}
+		case 'PUT': {
+			return await handle_put(request, bucket);
+		}
+		case 'DELETE': {
+			return await handle_delete(request, bucket);
+		}
+		case 'MKCOL': {
+			return await handle_mkcol(request, bucket);
+		}
+		case 'PROPFIND': {
+			return await handle_propfind(request, bucket);
+		}
+		case 'COPY': {
+			return await handle_copy(request, bucket);
+		}
+		case 'MOVE': {
+			return await handle_move(request, bucket);
+		}
+		default: {
+			return new Response('Method Not Allowed', {
+				status: 405,
+				headers: {
+					'Allow': SUPPORT_METHODS.join(', '),
+					'DAV': DAV_CLASS,
+				}
 			});
 		}
+	}
+}
+
+export default {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		const { bucket } = env;
+
+		if (request.headers.get('Authorization') !== `Basic ${btoa(`${env.USERNAME}:${env.PASSWORD}`)}`) {
+			return new Response('Unauthorized', {
+				status: 401, headers: {
+					'WWW-Authenticate': 'Basic realm="webdav"',
+				}
+			});
+		}
+
+		let response: Response = await dispatch_handler(request, bucket);
 
 		// Set CORS headers
 		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
