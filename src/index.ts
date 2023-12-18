@@ -29,6 +29,27 @@ export interface Env {
 	PASSWORD: string;
 }
 
+async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean = false) {
+	let cursor: string | undefined = undefined;
+	do {
+		var r2_objects = await bucket.list({
+			prefix: prefix,
+			delimiter: isRecursive ? undefined : '/',
+			cursor: cursor,
+			include: ['httpMetadata', 'customMetadata'],
+		});
+
+		for (let object of r2_objects.objects) {
+			yield object;
+		}
+
+		if (r2_objects.truncated) {
+			cursor = r2_objects.cursor;
+		}
+	} while (r2_objects.truncated)
+}
+
+
 const DAV_CLASS = "1";
 const SUPPORT_METHODS = [
 	"OPTIONS",
@@ -106,14 +127,12 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 	let resource_path = make_resource_path(request);
 
 	if (request.url.endsWith('/')) {
-		let r2_objects = await bucket.list({
-			prefix: resource_path,
-			delimiter: '/',
-			include: ['httpMetadata', 'customMetadata'],
-		});
 		let page = '';
 		if (resource_path !== '') page += `<a href="../">..</a><br>`;
-		for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
+		for await (const object of listAll(bucket, resource_path)) {
+			if (object.key === resource_path) {
+				continue
+			}
 			let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
 		}
@@ -271,7 +290,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 		</propstat>
 	</response>
 </multistatus>
-							`, {
+`, {
 					status: 207,
 					headers: {
 						'Content-Type': 'text/xml',
@@ -353,37 +372,25 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-			let cursor: string | undefined = undefined;
-			do {
-				var r2_objects = await bucket.list({
-					prefix: resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/',
-					delimiter: '/',
-					cursor: cursor,
-					include: ['httpMetadata', 'customMetadata'],
-				});
-
-				for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
-					let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-					page += `
+			let prefix = resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/';
+			for await (let object of listAll(bucket, prefix)) {
+				let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+				page += `
 	<response>
 		<href>${href}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-							.filter(([_, value]) => value !== undefined)
-							.map(([key, value]) => `<${key}>${value}</${key}>`)
-							.join('\n				')
-						}
+						.filter(([_, value]) => value !== undefined)
+						.map(([key, value]) => `<${key}>${value}</${key}>`)
+						.join('\n				')
+					}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>`;
-				}
+			}
 
-				if (r2_objects.truncated) {
-					cursor = r2_objects.cursor;
-				}
-			} while (r2_objects.truncated)
 			page += '\n</multistatus>\n';
 			return new Response(page, {
 				status: 207,
@@ -433,36 +440,25 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-			let cursor: string | undefined = undefined;
-			do {
-				var r2_objects = await bucket.list({
-					prefix: resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/',
-					cursor: cursor,
-					include: ['httpMetadata', 'customMetadata'],
-				});
-
-				for (let object of r2_objects.objects.filter(object => object.key !== resource_path)) {
-					let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-					page += `
+			let prefix = resource_path.endsWith('/') || resource_path === "" ? resource_path : resource_path + '/';
+			for await (let object of listAll(bucket, prefix, true)) {
+				let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+				page += `
 	<response>
 		<href>${href}</href>
 		<propstat>
 			<prop>
 				${Object.entries(fromR2Object(object))
-							.filter(([_, value]) => value !== undefined)
-							.map(([key, value]) => `<${key}>${value}</${key}>`)
-							.join('\n				')
-						}
+						.filter(([_, value]) => value !== undefined)
+						.map(([key, value]) => `<${key}>${value}</${key}>`)
+						.join('\n				')
+					}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>`;
-				}
+			}
 
-				if (r2_objects.truncated) {
-					cursor = r2_objects.cursor;
-				}
-			} while (r2_objects.truncated);
 			page += '\n</multistatus>\n';
 			return new Response(page, {
 				status: 207,
