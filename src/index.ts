@@ -30,37 +30,24 @@ export interface Env {
 }
 
 async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean = false) {
-	let cursor: string | undefined = undefined;
-	do {
-		var r2_objects = await bucket.list({
-			prefix: prefix,
+	let cursor = undefined,
+		truncated = true;
+	while (truncated) {
+		const r2_objects = await bucket.list({
+			prefix,
+			cursor,
 			delimiter: isRecursive ? undefined : '/',
-			cursor: cursor,
-			include: ['httpMetadata', 'customMetadata'],
 		});
-
-		for (let object of r2_objects.objects) {
+		for (const object of r2_objects.objects) {
 			yield object;
 		}
-
-		if (r2_objects.truncated) {
-			cursor = r2_objects.cursor;
-		}
-	} while (r2_objects.truncated)
+		if (!r2_objects.truncated) break;
+		cursor = r2_objects.cursor;
+	}
 }
 
-
-const DAV_CLASS = "1";
-const SUPPORT_METHODS = [
-	"OPTIONS",
-	"PROPFIND",
-	"MKCOL",
-	"GET",
-	"HEAD",
-	"PUT",
-	"COPY",
-	"MOVE",
-];
+const DAV_CLASS = '1';
+const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'MKCOL', 'GET', 'HEAD', 'PUT', 'COPY', 'MOVE'];
 
 type DavProperties = {
 	creationdate: string | undefined;
@@ -71,7 +58,7 @@ type DavProperties = {
 	getetag: string | undefined;
 	getlastmodified: string | undefined;
 	resourcetype: string;
-}
+};
 
 function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	if (object === null || object === undefined) {
@@ -79,11 +66,11 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 			creationdate: new Date().toUTCString(),
 			displayname: undefined,
 			getcontentlanguage: undefined,
-			getcontentlength: "0",
+			getcontentlength: '0',
 			getcontenttype: undefined,
 			getetag: undefined,
 			getlastmodified: new Date().toUTCString(),
-			resourcetype: "<collection />",
+			resourcetype: '<collection />',
 		};
 	}
 
@@ -99,20 +86,19 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	};
 }
 
-
 function make_resource_path(request: Request): string {
 	let path = new URL(request.url).pathname.slice(1);
 	path = path.endsWith('/') ? path.slice(0, -1) : path;
 	return path;
 }
 
-async function handle_options(request: Request, bucket: R2Bucket): Promise<Response> {
+async function handle_options(_request: Request, _bucket: R2Bucket): Promise<Response> {
 	return new Response(null, {
 		status: 204,
 		headers: {
-			'DAV': DAV_CLASS,
-			'Allow': SUPPORT_METHODS.join(', '),
-		}
+			DAV: DAV_CLASS,
+			Allow: SUPPORT_METHODS.join(', '),
+		},
 	});
 }
 
@@ -132,50 +118,45 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		let page = '';
 		if (resource_path !== '') page += `<a href="../">..</a><br>`;
 		for await (const object of listAll(bucket, resource_path)) {
-			if (object.key === resource_path) {
-				continue
-			}
+			if (object.key === resource_path) continue;
 			let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
 		}
 		return new Response(page, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 	} else {
-		let object = await bucket.get(resource_path, {
+		const object = await bucket.get(resource_path, {
 			onlyIf: request.headers,
 			range: request.headers,
 		});
 
-		let isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody => {
-			return 'body' in object;
-		}
+		const isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody => 'body' in object;
+
+		const range = request.headers.get('Range');
+		const contentRange = (range: string, object: R2ObjectBody) => {
+			const [start, end] = range
+				.replace(/bytes=/, '')
+				.split('-')
+				.map(Number);
+			return { 'Content-Range': `bytes ${start}-${end}/${object.size}` };
+		};
 
 		if (object === null) {
 			return new Response('Not Found', { status: 404 });
 		} else if (!isR2ObjectBody(object)) {
-			return new Response("Precondition Failed", { status: 412 });
+			return new Response('Precondition Failed', { status: 412 });
 		} else {
 			return new Response(object.body, {
-				status: object.range ? 206 : 200,
+				status: range ? 206 : 200,
 				headers: {
+					//
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
-					// TODO: Content-Length, Content-Range
-
-					...(object.httpMetadata?.contentDisposition ? {
-						'Content-Disposition': object.httpMetadata.contentDisposition,
-					} : {}),
-					...(object.httpMetadata?.contentEncoding ? {
-						'Content-Encoding': object.httpMetadata.contentEncoding,
-					} : {}),
-					...(object.httpMetadata?.contentLanguage ? {
-						'Content-Language': object.httpMetadata.contentLanguage,
-					} : {}),
-					...(object.httpMetadata?.cacheControl ? {
-						'Cache-Control': object.httpMetadata.cacheControl,
-					} : {}),
-					...(object.httpMetadata?.cacheExpiry ? {
-						'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-					} : {}),
-				}
+					...(range && contentRange(range, object)),
+					...(object.httpMetadata?.contentDisposition && { 'Content-Disposition': object.httpMetadata.contentDisposition }),
+					...(object.httpMetadata?.contentEncoding && { 'Content-Encoding': object.httpMetadata.contentEncoding }),
+					...(object.httpMetadata?.contentLanguage && { 'Content-Language': object.httpMetadata.contentLanguage }),
+					...(object.httpMetadata?.cacheControl && { 'Cache-Control': object.httpMetadata.cacheControl }),
+					...(object.httpMetadata?.cacheExpiry && { 'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString() }),
+				},
 			});
 		}
 	}
@@ -209,18 +190,15 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 	let resource_path = make_resource_path(request);
 
 	if (resource_path === '') {
-		let r2_objects, cursor: string | undefined = undefined;
-		do {
-			r2_objects = await bucket.list({ cursor: cursor });
-			let keys = r2_objects.objects.map(object => object.key);
-			if (keys.length > 0) {
-				await bucket.delete(keys);
-			}
-
-			if (r2_objects.truncated) {
-				cursor = r2_objects.cursor;
-			}
-		} while (r2_objects.truncated);
+		let truncated = true,
+			cursor: string | undefined = undefined;
+		while (truncated) {
+			const r2_objects = await bucket.list({ cursor });
+			let keys = r2_objects.objects.map((object) => object.key);
+			if (keys.length > 0) await bucket.delete(keys);
+			if (!r2_objects.truncated) break;
+			cursor = r2_objects.cursor;
+		}
 
 		return new Response(null, { status: 204 });
 	}
@@ -234,21 +212,18 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 		return new Response(null, { status: 204 });
 	}
 
-	let r2_objects, cursor: string | undefined = undefined;
-	do {
-		r2_objects = await bucket.list({
-			prefix: resource_path + "/",
-			cursor: cursor,
+	let truncated = true,
+		cursor: string | undefined = undefined;
+	while (truncated) {
+		const r2_objects = await bucket.list({
+			prefix: resource_path + '/',
+			cursor,
 		});
-		let keys = r2_objects.objects.map(object => object.key);
-		if (keys.length > 0) {
-			await bucket.delete(keys);
-		}
-
-		if (r2_objects.truncated) {
-			cursor = r2_objects.cursor;
-		}
-	} while (r2_objects.truncated);
+		let keys = r2_objects.objects.map((object) => object.key);
+		if (keys.length > 0) await bucket.delete(keys);
+		if (!r2_objects.truncated) break;
+		cursor = r2_objects.cursor;
+	}
 
 	return new Response(null, { status: 204 });
 }
@@ -267,15 +242,15 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	}
 
 	// Check if the parent directory exists
-	let parent_dir = resource_path.split('/').slice(0, -1).join("/");
+	let parent_dir = resource_path.split('/').slice(0, -1).join('/');
 
-	if (parent_dir !== '' && !await bucket.head(parent_dir)) {
+	if (parent_dir !== '' && !(await bucket.head(parent_dir))) {
 		return new Response('Conflict', { status: 409 });
 	}
 
 	await bucket.put(resource_path, new Uint8Array(), {
 		httpMetadata: request.headers,
-		customMetadata: { resourcetype: '<collection />' }
+		customMetadata: { resourcetype: '<collection />' },
 	});
 	return new Response('', { status: 201 });
 }
@@ -287,20 +262,24 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-	if (resource_path === "") {
-		page += `
-	<response>
-		<href>/</href>
+	const create_page = (href: string, object: R2Object | null) => {
+		const davPropertites = Object.entries(fromR2Object(object))
+			.filter(([_, value]) => value !== undefined)
+			.map(([key, value]) => `<${key}>${value}</${key}>`)
+			.join('\n				');
+		return `<response>
+	<href>${href}</href>
 		<propstat>
 			<prop>
-			${Object.entries(fromR2Object(null))
-				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => `<${key}>${value}</${key}>`)
-				.join('\n				')}
+			${davPropertites}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>`;
+	};
+
+	if (resource_path === '') {
+		page += create_page('/', null);
 		is_collection = true;
 	} else {
 		let object = await bucket.head(resource_path);
@@ -309,65 +288,31 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 		}
 		is_collection = object.customMetadata?.resourcetype === '<collection />';
 		let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-		page += `
-	<response>
-		<href>${href}</href>
-		<propstat>
-			<prop>
-			${Object.entries(fromR2Object(object))
-				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => `<${key}>${value}</${key}>`)
-				.join('\n				')}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`
-	};
+		page += create_page(href, object);
+	}
 
 	if (is_collection) {
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
-			case '0': break;
-			case '1': {
-				let prefix = resource_path === "" ? resource_path : resource_path + '/';
-				for await (let object of listAll(bucket, prefix)) {
-					let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-					page += `
-	<response>
-		<href>${href}</href>
-		<propstat>
-			<prop>
-				${Object.entries(fromR2Object(object))
-							.filter(([_, value]) => value !== undefined)
-							.map(([key, value]) => `<${key}>${value}</${key}>`)
-							.join('\n				')}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`;
-				}
-			}
+			case '0':
 				break;
-			case 'infinity': {
-				let prefix = resource_path === "" ? resource_path : resource_path + '/';
-				for await (let object of listAll(bucket, prefix, true)) {
-					let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-					page += `
-	<response>
-		<href>${href}</href>
-		<propstat>
-			<prop>
-				${Object.entries(fromR2Object(object))
-							.filter(([_, value]) => value !== undefined)
-							.map(([key, value]) => `<${key}>${value}</${key}>`)
-							.join('\n				')
-						}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`;
+			case '1':
+				{
+					let prefix = resource_path === '' ? resource_path : resource_path + '/';
+					for await (let object of listAll(bucket, prefix)) {
+						let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+						page += create_page(href, object);
+					}
 				}
-			}
+				break;
+			case 'infinity':
+				{
+					let prefix = resource_path === '' ? resource_path : resource_path + '/';
+					for await (let object of listAll(bucket, prefix, true)) {
+						let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+						page += create_page(href, object);
+					}
+				}
 				break;
 			default: {
 				return new Response('Forbidden', { status: 403 });
@@ -395,8 +340,11 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
 
 	// Check if the parent directory exists
-	let destination_parent = destination.split('/').slice(0, destination.endsWith('/') ? -2 : -1).join('/');
-	if (destination_parent !== '' && !await bucket.head(destination_parent)) {
+	let destination_parent = destination
+		.split('/')
+		.slice(0, destination.endsWith('/') ? -2 : -1)
+		.join('/');
+	if (destination_parent !== '' && !(await bucket.head(destination_parent))) {
 		return new Response('Conflict', { status: 409 });
 	}
 
@@ -417,10 +365,10 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
 			case 'infinity': {
-				let prefix = resource_path + "/";
+				let prefix = resource_path + '/';
 				const copy = async (object: R2Object) => {
-					let target = destination + "/" + object.key.slice(prefix.length);
-					target = target.endsWith("/") ? target.slice(0, -1) : target;
+					let target = destination + '/' + object.key.slice(prefix.length);
+					target = target.endsWith('/') ? target.slice(0, -1) : target;
 					let src = await bucket.get(object.key);
 					if (src !== null) {
 						await bucket.put(target, src.body, {
@@ -487,8 +435,11 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
 
 	// Check if the parent directory exists
-	let destination_parent = destination.split('/').slice(0, destination.endsWith('/') ? -2 : -1).join('/');
-	if (destination_parent !== '' && !await bucket.head(destination_parent)) {
+	let destination_parent = destination
+		.split('/')
+		.slice(0, destination.endsWith('/') ? -2 : -1)
+		.join('/');
+	if (destination_parent !== '' && !(await bucket.head(destination_parent))) {
 		return new Response('Conflict', { status: 409 });
 	}
 
@@ -506,7 +457,8 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		return new Response('Bad Request', { status: 400 });
 	}
 
-	if (destination_exists) { // Delete the destination first
+	if (destination_exists) {
+		// Delete the destination first
 		await handle_delete(new Request(new URL(destination_header), request), bucket);
 	}
 
@@ -516,10 +468,10 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
 			case 'infinity': {
-				let prefix = resource_path + "/";
+				let prefix = resource_path + '/';
 				const copy = async (object: R2Object) => {
-					let target = destination + "/" + object.key.slice(prefix.length);
-					target = target.endsWith("/") ? target.slice(0, -1) : target;
+					let target = destination + '/' + object.key.slice(prefix.length);
+					target = target.endsWith('/') ? target.slice(0, -1) : target;
 					let src = await bucket.get(object.key);
 					if (src !== null) {
 						await bucket.put(target, src.body, {
@@ -611,9 +563,9 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 			return new Response('Method Not Allowed', {
 				status: 405,
 				headers: {
-					'Allow': SUPPORT_METHODS.join(', '),
-					'DAV': DAV_CLASS,
-				}
+					Allow: SUPPORT_METHODS.join(', '),
+					DAV: DAV_CLASS,
+				},
 			});
 		}
 	}
@@ -625,9 +577,10 @@ export default {
 
 		if (request.headers.get('Authorization') !== `Basic ${btoa(`${env.USERNAME}:${env.PASSWORD}`)}`) {
 			return new Response('Unauthorized', {
-				status: 401, headers: {
+				status: 401,
+				headers: {
 					'WWW-Authenticate': 'Basic realm="webdav"',
-				}
+				},
 			});
 		}
 
@@ -636,15 +589,16 @@ export default {
 		// Set CORS headers
 		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
 		response.headers.set('Access-Control-Allow-Methods', SUPPORT_METHODS.join(', '));
-		response.headers.set('Access-Control-Allow-Headers',
-			["authorization", "content-type", "depth", "overwrite", "destination", "range"].join(', ')
+		response.headers.set(
+			'Access-Control-Allow-Headers',
+			['authorization', 'content-type', 'depth', 'overwrite', 'destination', 'range'].join(', ')
 		);
-		response.headers.set('Access-Control-Expose-Headers',
-			["content-type", "content-length", "dav", "etag", "last-modified", "location", "date", "content-range"].join(', ')
+		response.headers.set(
+			'Access-Control-Expose-Headers',
+			['content-type', 'content-length', 'dav', 'etag', 'last-modified', 'location', 'date', 'content-range'].join(', ')
 		);
-		response.headers.set('Access-Control-Allow-Credentials', 'false');
 		response.headers.set('Access-Control-Max-Age', '86400');
 
-		return response
+		return response;
 	},
 };
