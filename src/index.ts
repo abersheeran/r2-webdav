@@ -30,9 +30,8 @@ export interface Env {
 }
 
 async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean = false) {
-	let cursor = undefined,
-		truncated = true;
-	while (truncated) {
+	let cursor = undefined;
+	while (true) {
 		const r2_objects = await bucket.list({
 			prefix,
 			cursor,
@@ -237,7 +236,7 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 	return new Response(rangeStream, {
 		status: 206,
 		headers: {
-			...getHeaders(object, { type: 2, boundary })
+			...getHeaders(object, { type: 2, boundary }),
 		},
 	});
 }
@@ -270,9 +269,8 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 	let resource_path = make_resource_path(request);
 
 	if (resource_path === '') {
-		let truncated = true,
-			cursor: string | undefined = undefined;
-		while (truncated) {
+		let cursor: string | undefined = undefined;
+		while (true) {
 			const r2_objects = await bucket.list({ cursor });
 			let keys = r2_objects.objects.map((object) => object.key);
 			if (keys.length > 0) await bucket.delete(keys);
@@ -292,9 +290,8 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 		return new Response(null, { status: 204 });
 	}
 
-	let truncated = true,
-		cursor: string | undefined = undefined;
-	while (truncated) {
+	let cursor: string | undefined = undefined;
+	while (true) {
 		const r2_objects = await bucket.list({
 			prefix: resource_path + '/',
 			cursor,
@@ -342,7 +339,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-	const create_page = (href: string, object: R2Object | null) => {
+	const create_prop_response = (href: string, object: R2Object | null) => {
 		const davPropertites = Object.entries(fromR2Object(object))
 			.filter(([_, value]) => value !== undefined)
 			.map(([key, value]) => `<${key}>${value}</${key}>`)
@@ -359,7 +356,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	};
 
 	if (resource_path === '') {
-		page += create_page('/', null);
+		page += create_prop_response('/', null);
 		is_collection = true;
 	} else {
 		let object = await bucket.head(resource_path);
@@ -368,7 +365,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 		}
 		is_collection = object.customMetadata?.resourcetype === '<collection />';
 		let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-		page += create_page(href, object);
+		page += create_prop_response(href, object);
 	}
 
 	if (is_collection) {
@@ -381,7 +378,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
 					for await (let object of listAll(bucket, prefix)) {
 						let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-						page += create_page(href, object);
+						page += create_prop_response(href, object);
 					}
 				}
 				break;
@@ -390,7 +387,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
 					for await (let object of listAll(bucket, prefix, true)) {
 						let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-						page += create_page(href, object);
+						page += create_prop_response(href, object);
 					}
 				}
 				break;
