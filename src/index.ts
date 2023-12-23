@@ -213,6 +213,7 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 	const rangeStream = new ReadableStream<Uint8Array>({
 		async start(controller) {
 			for (const [start, end] of r) {
+				// The privous 404 response has already handled, so it can't be null here.
 				const object = (await bucket.get(resource_path, {
 					range: { offset: start, length: end - start + 1 },
 				}))!;
