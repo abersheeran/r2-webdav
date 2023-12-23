@@ -49,6 +49,21 @@ async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean =
 const DAV_CLASS = '1';
 const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'MKCOL', 'GET', 'HEAD', 'PUT', 'COPY', 'MOVE'];
 
+// 0: no range, 1: only a range, 2: multiple ranges
+type RangeType =
+	| {
+			type: 0;
+	  }
+	| {
+			type: 1;
+			start: number;
+			end: number;
+	  }
+	| {
+			type: 2;
+			boundary: string;
+	  };
+
 type DavProperties = {
 	creationdate: string | undefined;
 	displayname: string | undefined;
@@ -123,43 +138,108 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
 		}
 		return new Response(page, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-	} else {
-		const object = await bucket.get(resource_path, {
-			onlyIf: request.headers,
-			range: request.headers,
-		});
-
-		const isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody => 'body' in object;
-
-		const range = request.headers.get('Range');
-		const contentRange = (range: string, object: R2ObjectBody) => {
-			const [start, end] = range
-				.replace(/bytes=/, '')
-				.split('-')
-				.map(Number);
-			return { 'Content-Range': `bytes ${start}-${end}/${object.size}` };
-		};
-
-		if (object === null) {
-			return new Response('Not Found', { status: 404 });
-		} else if (!isR2ObjectBody(object)) {
-			return new Response('Precondition Failed', { status: 412 });
-		} else {
-			return new Response(object.body, {
-				status: range ? 206 : 200,
-				headers: {
-					//
-					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
-					...(range && contentRange(range, object)),
-					...(object.httpMetadata?.contentDisposition && { 'Content-Disposition': object.httpMetadata.contentDisposition }),
-					...(object.httpMetadata?.contentEncoding && { 'Content-Encoding': object.httpMetadata.contentEncoding }),
-					...(object.httpMetadata?.contentLanguage && { 'Content-Language': object.httpMetadata.contentLanguage }),
-					...(object.httpMetadata?.cacheControl && { 'Cache-Control': object.httpMetadata.cacheControl }),
-					...(object.httpMetadata?.cacheExpiry && { 'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString() }),
-				},
-			});
-		}
 	}
+	const object = await bucket.get(resource_path, {
+		onlyIf: request.headers,
+		range: request.headers,
+	});
+
+	const isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody => 'body' in object;
+
+	if (object === null) {
+		return new Response('Not Found', { status: 404 });
+	} else if (!isR2ObjectBody(object)) {
+		return new Response('Precondition Failed', { status: 412 });
+	}
+
+	const getHeaders = (object: R2ObjectBody, range_type: RangeType) => {
+		const headers = {
+			'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+			...(object.httpMetadata?.contentDisposition && { 'Content-Disposition': object.httpMetadata.contentDisposition }),
+			...(object.httpMetadata?.contentEncoding && { 'Content-Encoding': object.httpMetadata.contentEncoding }),
+			...(object.httpMetadata?.contentLanguage && { 'Content-Language': object.httpMetadata.contentLanguage }),
+			...(object.httpMetadata?.cacheControl && { 'Cache-Control': object.httpMetadata.cacheControl }),
+			...(object.httpMetadata?.cacheExpiry && { 'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString() }),
+		};
+		switch (range_type.type) {
+			case 0:
+				return headers;
+			case 1: {
+				const { start, end } = range_type;
+				return {
+					...headers,
+					// When end is not specified, set end to the maximum index of the object
+					'Content-Range': `bytes ${start}-${end || object.size - 1}/${object.size}`,
+				};
+			}
+			case 2: {
+				headers['Content-Type'] = `multipart/byteranges; boundary=${range_type.boundary}`;
+				return headers;
+			}
+		}
+	};
+
+	const rangeHeader = request.headers.get('Range');
+
+	if (!rangeHeader) {
+		return new Response(object.body, {
+			status: 200,
+			headers: getHeaders(object, { type: 0 }),
+		});
+	}
+
+	const ranges = rangeHeader.replace(/bytes=/, '').split(',');
+	if (ranges.length === 1) {
+		const [start, end] = ranges[0].split('-').map(Number);
+		if (!end || start >= object.size || end >= object.size || (end !== 0 && start >= end)) {
+			return new Response('Range Not Satisfiable', { status: 416 });
+		}
+		return new Response(object.body, {
+			status: 206,
+			headers: getHeaders(object, { type: 1, start, end }),
+		});
+	}
+
+	const r: [number, number][] = [];
+	for (const range of ranges) {
+		const [start, end] = range.split('-').map(Number);
+		if (!end || start >= object.size || end >= object.size || (end !== 0 && start >= end)) {
+			return new Response('Range Not Satisfiable', { status: 416 });
+		}
+		r.push([start, end]);
+	}
+
+	const boundary = `------------${crypto.randomUUID()}`;
+	const encode = new TextEncoder();
+	const rangeStream = new ReadableStream<Uint8Array>({
+		async start(controller) {
+			for (const [start, end] of r) {
+				const object = (await bucket.get(resource_path, {
+					range: { offset: start, length: end - start + 1 },
+				}))!;
+
+				controller.enqueue(encode.encode(`${boundary}\r\n`));
+				controller.enqueue(encode.encode(`Content-Type: ${object.httpMetadata?.contentType ?? 'application/octet-stream'}\r\n`));
+				controller.enqueue(encode.encode(`Content-Range: bytes ${start}-${end || object.size}/${object.size}\r\n`));
+				controller.enqueue(encode.encode('\r\n'));
+				const reader = object.body.getReader();
+				let done, value;
+				while ((({ done, value } = await reader.read()), !done)) {
+					controller.enqueue(value);
+				}
+				controller.enqueue(encode.encode('\r\n'));
+			}
+			controller.enqueue(encode.encode(`${boundary}--`));
+			controller.close();
+		},
+	});
+
+	return new Response(rangeStream, {
+		status: 206,
+		headers: {
+			...getHeaders(object, { type: 2, boundary })
+		},
+	});
 }
 
 async function handle_put(request: Request, bucket: R2Bucket): Promise<Response> {
