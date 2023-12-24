@@ -36,6 +36,7 @@ async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean =
 			prefix,
 			cursor,
 			delimiter: isRecursive ? undefined : '/',
+			include: ['httpMetadata', 'customMetadata'],
 		});
 		for (const object of r2_objects.objects) {
 			yield object;
