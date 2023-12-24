@@ -18,8 +18,8 @@ USERNAME = "USERNAME"
 PASSWORD = "PASSWORD"
 ```
 
-* USERNAME: The username of WebDav.
-* PASSWORD: The password of WebDav.
+- USERNAME: The username of WebDav.
+- PASSWORD: The password of WebDav.
 
 ## Development
 
