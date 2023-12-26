@@ -4,22 +4,24 @@
 
 Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
-## Configuration
+## Usage
 
 Change wrangler.toml to your own.
 
 ```toml
 [[r2_buckets]]
-binding = 'webdav' # <~ valid JavaScript variable name, don't change this
+binding = 'bucket' # <~ valid JavaScript variable name, don't change this
 bucket_name = 'webdav'
-
-[vars]
-USERNAME = "USERNAME"
-PASSWORD = "PASSWORD"
 ```
 
-- USERNAME: The username of WebDav.
-- PASSWORD: The password of WebDav.
+Then use wrangler to deploy.
+
+```bash
+wrangler deploy
+
+wrangler secret put USERNAME
+wrangler secret put PASSWORD
+```
 
 ## Development
 
