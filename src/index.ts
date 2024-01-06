@@ -151,28 +151,28 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 
 					...(object.httpMetadata?.contentDisposition
 						? {
-								'Content-Disposition': object.httpMetadata.contentDisposition,
-							}
+							'Content-Disposition': object.httpMetadata.contentDisposition,
+						}
 						: {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
-								'Content-Encoding': object.httpMetadata.contentEncoding,
-							}
+							'Content-Encoding': object.httpMetadata.contentEncoding,
+						}
 						: {}),
 					...(object.httpMetadata?.contentLanguage
 						? {
-								'Content-Language': object.httpMetadata.contentLanguage,
-							}
+							'Content-Language': object.httpMetadata.contentLanguage,
+						}
 						: {}),
 					...(object.httpMetadata?.cacheControl
 						? {
-								'Cache-Control': object.httpMetadata.cacheControl,
-							}
+							'Cache-Control': object.httpMetadata.cacheControl,
+						}
 						: {}),
 					...(object.httpMetadata?.cacheExpiry
 						? {
-								'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-							}
+							'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+						}
 						: {}),
 				},
 			});
@@ -281,15 +281,9 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	return new Response('', { status: 201 });
 }
 
-async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
-
-	let is_collection: boolean;
-	let page = `<?xml version="1.0" encoding="utf-8"?>
-<multistatus xmlns="DAV:">`;
-
-	if (resource_path === '') {
-		page += `
+function generate_propfind_response(object: R2Object | null): string {
+	if (object === null) {
+		return `
 	<response>
 		<href>/</href>
 		<propstat>
@@ -302,6 +296,33 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
 	</response>`;
+	}
+
+	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+	return `
+	<response>
+		<href>${href}</href>
+		<propstat>
+			<prop>
+			${Object.entries(fromR2Object(object))
+			.filter(([_, value]) => value !== undefined)
+			.map(([key, value]) => `<${key}>${value}</${key}>`)
+			.join('\n				')}
+			</prop>
+			<status>HTTP/1.1 200 OK</status>
+		</propstat>
+	</response>`;
+}
+
+async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+
+	let is_collection: boolean;
+	let page = `<?xml version="1.0" encoding="utf-8"?>
+<multistatus xmlns="DAV:">`;
+
+	if (resource_path === '') {
+		page += generate_propfind_response(null);
 		is_collection = true;
 	} else {
 		let object = await bucket.head(resource_path);
@@ -309,20 +330,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			return new Response('Not Found', { status: 404 });
 		}
 		is_collection = object.customMetadata?.resourcetype === '<collection />';
-		let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-		page += `
-	<response>
-		<href>${href}</href>
-		<propstat>
-			<prop>
-			${Object.entries(fromR2Object(object))
-				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => `<${key}>${value}</${key}>`)
-				.join('\n				')}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`;
+		page += generate_propfind_response(object);
 	}
 
 	if (is_collection) {
@@ -334,20 +342,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				{
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
 					for await (let object of listAll(bucket, prefix)) {
-						let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-						page += `
-	<response>
-		<href>${href}</href>
-		<propstat>
-			<prop>
-				${Object.entries(fromR2Object(object))
-					.filter(([_, value]) => value !== undefined)
-					.map(([key, value]) => `<${key}>${value}</${key}>`)
-					.join('\n				')}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`;
+						page += generate_propfind_response(object);
 					}
 				}
 				break;
@@ -355,20 +350,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				{
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
 					for await (let object of listAll(bucket, prefix, true)) {
-						let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-						page += `
-	<response>
-		<href>${href}</href>
-		<propstat>
-			<prop>
-				${Object.entries(fromR2Object(object))
-					.filter(([_, value]) => value !== undefined)
-					.map(([key, value]) => `<${key}>${value}</${key}>`)
-					.join('\n				')}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`;
+						page += generate_propfind_response(object);
 					}
 				}
 				break;
