@@ -138,28 +138,28 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 
 					...(object.httpMetadata?.contentDisposition
 						? {
-							'Content-Disposition': object.httpMetadata.contentDisposition,
-						}
+								'Content-Disposition': object.httpMetadata.contentDisposition,
+							}
 						: {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
-							'Content-Encoding': object.httpMetadata.contentEncoding,
-						}
+								'Content-Encoding': object.httpMetadata.contentEncoding,
+							}
 						: {}),
 					...(object.httpMetadata?.contentLanguage
 						? {
-							'Content-Language': object.httpMetadata.contentLanguage,
-						}
+								'Content-Language': object.httpMetadata.contentLanguage,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheControl
 						? {
-							'Cache-Control': object.httpMetadata.cacheControl,
-						}
+								'Cache-Control': object.httpMetadata.cacheControl,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheExpiry
 						? {
-							'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-						}
+								'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+							}
 						: {}),
 				},
 			});
@@ -292,9 +292,9 @@ function generate_propfind_response(object: R2Object | null): string {
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
-			.filter(([_, value]) => value !== undefined)
-			.map(([key, value]) => `<${key}>${value}</${key}>`)
-			.join('\n				')}
+				.filter(([_, value]) => value !== undefined)
+				.map(([key, value]) => `<${key}>${value}</${key}>`)
+				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
@@ -496,7 +496,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		switch (depth) {
 			case 'infinity': {
 				let prefix = resource_path + '/';
-				const copy = async (object: R2Object) => {
+				const move = async (object: R2Object) => {
 					let target = destination + '/' + object.key.slice(prefix.length);
 					target = target.endsWith('/') ? target.slice(0, -1) : target;
 					let src = await bucket.get(object.key);
@@ -508,9 +508,9 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 						await bucket.delete(object.key);
 					}
 				};
-				let promise_array = [copy(resource)];
+				let promise_array = [move(resource)];
 				for await (let object of listAll(bucket, prefix, true)) {
-					promise_array.push(copy(object));
+					promise_array.push(move(object));
 				}
 				await Promise.all(promise_array);
 				if (destination_exists) {
