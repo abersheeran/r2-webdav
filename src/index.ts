@@ -49,9 +49,6 @@ async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean =
 	} while (r2_objects.truncated);
 }
 
-const DAV_CLASS = '1';
-const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'MKCOL', 'GET', 'HEAD', 'PUT', 'COPY', 'MOVE'];
-
 type DavProperties = {
 	creationdate: string | undefined;
 	displayname: string | undefined;
@@ -93,16 +90,6 @@ function make_resource_path(request: Request): string {
 	let path = new URL(request.url).pathname.slice(1);
 	path = path.endsWith('/') ? path.slice(0, -1) : path;
 	return path;
-}
-
-async function handle_options(request: Request, bucket: R2Bucket): Promise<Response> {
-	return new Response(null, {
-		status: 204,
-		headers: {
-			DAV: DAV_CLASS,
-			Allow: SUPPORT_METHODS.join(', '),
-		},
-	});
 }
 
 async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
@@ -151,28 +138,28 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 
 					...(object.httpMetadata?.contentDisposition
 						? {
-								'Content-Disposition': object.httpMetadata.contentDisposition,
-							}
+							'Content-Disposition': object.httpMetadata.contentDisposition,
+						}
 						: {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
-								'Content-Encoding': object.httpMetadata.contentEncoding,
-							}
+							'Content-Encoding': object.httpMetadata.contentEncoding,
+						}
 						: {}),
 					...(object.httpMetadata?.contentLanguage
 						? {
-								'Content-Language': object.httpMetadata.contentLanguage,
-							}
+							'Content-Language': object.httpMetadata.contentLanguage,
+						}
 						: {}),
 					...(object.httpMetadata?.cacheControl
 						? {
-								'Cache-Control': object.httpMetadata.cacheControl,
-							}
+							'Cache-Control': object.httpMetadata.cacheControl,
+						}
 						: {}),
 					...(object.httpMetadata?.cacheExpiry
 						? {
-								'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-							}
+							'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+						}
 						: {}),
 				},
 			});
@@ -305,9 +292,9 @@ function generate_propfind_response(object: R2Object | null): string {
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
-				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => `<${key}>${value}</${key}>`)
-				.join('\n				')}
+			.filter(([_, value]) => value !== undefined)
+			.map(([key, value]) => `<${key}>${value}</${key}>`)
+			.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
@@ -570,10 +557,19 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 }
 
+const DAV_CLASS = '1';
+const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'MKCOL', 'GET', 'HEAD', 'PUT', 'COPY', 'MOVE'];
+
 async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
 	switch (request.method) {
 		case 'OPTIONS': {
-			return await handle_options(request, bucket);
+			return new Response(null, {
+				status: 204,
+				headers: {
+					Allow: SUPPORT_METHODS.join(', '),
+					DAV: DAV_CLASS,
+				},
+			});
 		}
 		case 'HEAD': {
 			return await handle_head(request, bucket);
