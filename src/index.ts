@@ -133,41 +133,61 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		} else if (!isR2ObjectBody(object)) {
 			return new Response('Precondition Failed', { status: 412 });
 		} else {
+			const { rangeOffset, rangeEnd } = calcContentRange(object);
+			const contentLength = rangeEnd - rangeOffset + 1;
 			return new Response(object.body, {
-				status: object.range ? 206 : 200,
+				status: (object.range && contentLength !== object.size) ? 206 : 200,
 				headers: {
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
-					// TODO: Content-Length, Content-Range
-
+					'Content-Length': contentLength.toString(),
+					...({ 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` }),
 					...(object.httpMetadata?.contentDisposition
 						? {
-								'Content-Disposition': object.httpMetadata.contentDisposition,
-							}
+							'Content-Disposition': object.httpMetadata.contentDisposition,
+						}
 						: {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
-								'Content-Encoding': object.httpMetadata.contentEncoding,
-							}
+							'Content-Encoding': object.httpMetadata.contentEncoding,
+						}
 						: {}),
 					...(object.httpMetadata?.contentLanguage
 						? {
-								'Content-Language': object.httpMetadata.contentLanguage,
-							}
+							'Content-Language': object.httpMetadata.contentLanguage,
+						}
 						: {}),
 					...(object.httpMetadata?.cacheControl
 						? {
-								'Cache-Control': object.httpMetadata.cacheControl,
-							}
+							'Cache-Control': object.httpMetadata.cacheControl,
+						}
 						: {}),
 					...(object.httpMetadata?.cacheExpiry
 						? {
-								'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-							}
+							'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+						}
 						: {}),
 				},
 			});
 		}
 	}
+}
+
+function calcContentRange(object: R2ObjectBody) {
+	let rangeOffset = 0;
+	let rangeEnd = object.size - 1;
+	if (object.range) {
+		if ('suffix' in object.range) {
+			// Case 3: {suffix: number}
+			rangeOffset = object.size - object.range.suffix;
+		} else {
+			// Case 1: {offset: number, length?: number}
+			// Case 2: {offset?: number, length: number}
+			rangeOffset = object.range.offset ?? 0;
+			let length = object.range.length ?? (object.size - rangeOffset);
+			rangeEnd = Math.min(rangeOffset + length - 1, object.size - 1);
+		}
+	}
+	return { rangeOffset, rangeEnd };
 }
 
 async function handle_put(request: Request, bucket: R2Bucket): Promise<Response> {
