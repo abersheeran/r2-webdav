@@ -9,20 +9,8 @@
  */
 
 export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
-	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	// MY_DURABLE_OBJECT: DurableObjectNamespace;
-	//
 	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
 	bucket: R2Bucket;
-	//
-	// Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-	// MY_SERVICE: Fetcher;
-	//
-	// Example binding to a Queue. Learn more at https://developers.cloudflare.com/queues/javascript-apis/
-	// MY_QUEUE: Queue;
 
 	// Variables defined in the "Environment Variables" section of the Wrangler CLI or dashboard
 	USERNAME: string;
@@ -36,6 +24,7 @@ async function* listAll(bucket: R2Bucket, prefix: string, isRecursive: boolean =
 			prefix: prefix,
 			delimiter: isRecursive ? undefined : '/',
 			cursor: cursor,
+			// @ts-ignore https://developers.cloudflare.com/r2/api/workers/workers-api-reference/#r2listoptions
 			include: ['httpMetadata', 'customMetadata'],
 		});
 
@@ -105,14 +94,19 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 	let resource_path = make_resource_path(request);
 
 	if (request.url.endsWith('/')) {
-		let page = '';
-		if (resource_path !== '') page += `<a href="../">..</a><br>`;
-		for await (const object of listAll(bucket, resource_path)) {
+		let page = '',
+			prefix = resource_path;
+		if (resource_path !== '') {
+			page += `<a href="../">..</a><br>`;
+			prefix = `${resource_path}/`;
+		}
+
+		for await (const object of listAll(bucket, prefix)) {
 			if (object.key === resource_path) {
 				continue;
 			}
 			let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key}</a><br>`;
+			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length)}</a><br>`;
 		}
 		return new Response(page, {
 			status: 200,
@@ -136,35 +130,35 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
 			const contentLength = rangeEnd - rangeOffset + 1;
 			return new Response(object.body, {
-				status: (object.range && contentLength !== object.size) ? 206 : 200,
+				status: object.range && contentLength !== object.size ? 206 : 200,
 				headers: {
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
 					'Content-Length': contentLength.toString(),
-					...({ 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` }),
+					...{ 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` },
 					...(object.httpMetadata?.contentDisposition
 						? {
-							'Content-Disposition': object.httpMetadata.contentDisposition,
-						}
+								'Content-Disposition': object.httpMetadata.contentDisposition,
+							}
 						: {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
-							'Content-Encoding': object.httpMetadata.contentEncoding,
-						}
+								'Content-Encoding': object.httpMetadata.contentEncoding,
+							}
 						: {}),
 					...(object.httpMetadata?.contentLanguage
 						? {
-							'Content-Language': object.httpMetadata.contentLanguage,
-						}
+								'Content-Language': object.httpMetadata.contentLanguage,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheControl
 						? {
-							'Cache-Control': object.httpMetadata.cacheControl,
-						}
+								'Cache-Control': object.httpMetadata.cacheControl,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheExpiry
 						? {
-							'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-						}
+								'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+							}
 						: {}),
 				},
 			});
@@ -183,7 +177,7 @@ function calcContentRange(object: R2ObjectBody) {
 			// Case 1: {offset: number, length?: number}
 			// Case 2: {offset?: number, length: number}
 			rangeOffset = object.range.offset ?? 0;
-			let length = object.range.length ?? (object.size - rangeOffset);
+			let length = object.range.length ?? object.size - rangeOffset;
 			rangeEnd = Math.min(rangeOffset + length - 1, object.size - 1);
 		}
 	}
@@ -375,6 +369,123 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 		status: 207,
 		headers: {
 			'Content-Type': 'text/xml',
+		},
+	});
+}
+
+async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Response> {
+	const resource_path = make_resource_path(request);
+
+	// 检查资源是否存在
+	let object = await bucket.head(resource_path);
+	if (object === null) {
+		return new Response('Not Found', { status: 404 });
+	}
+
+	// 读取请求体
+	const body = await request.text();
+
+	// 使用 HTMLRewriter 解析 XML
+	const setProperties: { [key: string]: string } = {};
+	const removeProperties: string[] = [];
+	let currentAction: 'set' | 'remove' | null = null;
+	let currentPropName: string | null = null;
+	let currentPropValue: string = '';
+
+	class PropHandler {
+		element(element: Element) {
+			const tagName = element.tagName.toLowerCase();
+			if (tagName === 'set') {
+				currentAction = 'set';
+			} else if (tagName === 'remove') {
+				currentAction = 'remove';
+			} else if (tagName === 'prop') {
+				// 忽略 <prop> 标签
+			} else {
+				// 属性名称
+				currentPropName = tagName;
+				currentPropValue = '';
+			}
+		}
+
+		text(textChunk: Text) {
+			if (currentPropName) {
+				currentPropValue += textChunk.text;
+			}
+		}
+
+		end(element: Element) {
+			if (currentAction === 'set' && currentPropName) {
+				setProperties[currentPropName] = currentPropValue.trim();
+			} else if (currentAction === 'remove' && currentPropName) {
+				removeProperties.push(currentPropName);
+			}
+			currentPropName = null;
+			currentPropValue = '';
+		}
+	}
+
+	// 使用 HTMLRewriter 解析请求体
+	await new HTMLRewriter().on('propertyupdate', new PropHandler()).transform(new Response(body)).arrayBuffer();
+
+	// 复制原有的自定义元数据
+	const customMetadata = object.customMetadata ? { ...object.customMetadata } : {};
+
+	// 更新元数据
+	for (const propName in setProperties) {
+		customMetadata[propName] = setProperties[propName];
+	}
+
+	for (const propName of removeProperties) {
+		delete customMetadata[propName];
+	}
+
+	// 更新对象的元数据
+	const src = await bucket.get(object.key);
+	if (src === null) {
+		return new Response('Not Found', { status: 404 });
+	}
+
+	await bucket.put(object.key, src.body, {
+		httpMetadata: object.httpMetadata,
+		customMetadata: customMetadata,
+	});
+
+	// 构造响应
+	let responseXML = '<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">\n';
+
+	for (const propName in setProperties) {
+		responseXML += `
+    <response>
+        <href>/${object.key}</href>
+        <propstat>
+            <prop>
+                <${propName} />
+            </prop>
+            <status>HTTP/1.1 200 OK</status>
+        </propstat>
+    </response>\n`;
+	}
+
+	for (const propName of removeProperties) {
+		responseXML += `
+    <response>
+        <href>/${object.key}</href>
+        <propstat>
+            <prop>
+                <${propName} />
+            </prop>
+            <status>HTTP/1.1 200 OK</status>
+        </propstat>
+    </response>\n`;
+	}
+
+	responseXML += '</multistatus>';
+
+	return new Response(responseXML, {
+		status: 207,
+		headers: {
+			'Content-Type': 'application/xml; charset="utf-8"',
 		},
 	});
 }
@@ -580,8 +691,8 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 }
 
-const DAV_CLASS = '1';
-const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'MKCOL', 'GET', 'HEAD', 'PUT', 'COPY', 'MOVE'];
+const DAV_CLASS = '1, 3';
+const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'GET', 'HEAD', 'PUT', 'DELETE', 'COPY', 'MOVE'];
 
 async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
 	switch (request.method) {
@@ -611,6 +722,9 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 		}
 		case 'PROPFIND': {
 			return await handle_propfind(request, bucket);
+		}
+		case 'PROPPATCH': {
+			return await handle_proppatch(request, bucket);
 		}
 		case 'COPY': {
 			return await handle_copy(request, bucket);
