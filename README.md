@@ -34,3 +34,7 @@ $ npm run dev
 # deploy your Worker globally to the Cloudflare network (update your wrangler.toml file for configuration)
 $ npm run deploy
 ```
+
+## Test
+
+Use [litmus](https://github.com/notroj/litmus) to test.
