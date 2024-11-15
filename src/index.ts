@@ -749,13 +749,22 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 	}
 }
 
+function is_authorized(authorization_header: string, username: string, password: string): boolean {
+    const encoder = new TextEncoder();
+
+    const header = encoder.encode(authorization_header);
+    const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
+
+    return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
+}
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { bucket } = env;
 
 		if (
 			request.method !== 'OPTIONS' &&
-			request.headers.get('Authorization') !== `Basic ${btoa(`${env.USERNAME}:${env.PASSWORD}`)}`
+			!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)
 		) {
 			return new Response('Unauthorized', {
 				status: 401,
