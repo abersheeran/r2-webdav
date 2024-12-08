@@ -703,7 +703,7 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 	switch (request.method) {
 		case 'OPTIONS': {
 			return new Response(null, {
-				status: 204,
+				status: 200,
 				headers: {
 					Allow: SUPPORT_METHODS.join(', '),
 					DAV: DAV_CLASS,
