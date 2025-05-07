@@ -2,7 +2,7 @@ compatibility_date = "2023-10-16"
 main = "src/index.ts"
 name = "r2-webdav"
 
-node_compat = true
+compatibility_flags = ["nodejs_compat"]
 
 # Bind an R2 Bucket. Use R2 to store arbitrarily large blobs of data, such as files.
 # Docs: https://developers.cloudflare.com/r2/api/workers/workers-api-usage/
