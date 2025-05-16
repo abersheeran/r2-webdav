@@ -13,7 +13,7 @@
 		"@cloudflare/workers-types": "*",
 		"prettier": "^3.1.1",
 		"typescript": "^5.0.4",
-		"wrangler": "^3.0.0"
+		"wrangler": "^4.15.2"
 	},
 	"type": "module"
 }
