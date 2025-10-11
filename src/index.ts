@@ -75,8 +75,12 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	};
 }
 
-function make_resource_path(request: Request): string {
-	let path = new URL(request.url).pathname.slice(1);
+function make_resource_path(url: string): string {
+	if (!url.startsWith('http')) {
+		return '';
+	}
+	let path = new URL(url).pathname.slice(1);
+	path = decodeURIComponent(path);
 	path = path.endsWith('/') ? path.slice(0, -1) : path;
 	return path;
 }
@@ -91,7 +95,7 @@ async function handle_head(request: Request, bucket: R2Bucket): Promise<Response
 }
 
 async function handle_get(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request.url);
 
 	if (request.url.endsWith('/')) {
 		let page = '',
@@ -140,28 +144,28 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 					...{ 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` },
 					...(object.httpMetadata?.contentDisposition
 						? {
-							'Content-Disposition': object.httpMetadata.contentDisposition,
-						}
+								'Content-Disposition': object.httpMetadata.contentDisposition,
+							}
 						: {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
-							'Content-Encoding': object.httpMetadata.contentEncoding,
-						}
+								'Content-Encoding': object.httpMetadata.contentEncoding,
+							}
 						: {}),
 					...(object.httpMetadata?.contentLanguage
 						? {
-							'Content-Language': object.httpMetadata.contentLanguage,
-						}
+								'Content-Language': object.httpMetadata.contentLanguage,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheControl
 						? {
-							'Cache-Control': object.httpMetadata.cacheControl,
-						}
+								'Cache-Control': object.httpMetadata.cacheControl,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheExpiry
 						? {
-							'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-						}
+								'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+							}
 						: {}),
 				},
 			});
@@ -192,7 +196,7 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request.url);
 
 	// Check if the parent directory exists
 	let dirpath = resource_path.split('/').slice(0, -1).join('/');
@@ -212,7 +216,7 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 }
 
 async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request.url);
 
 	if (resource_path === '') {
 		let r2_objects,
@@ -268,7 +272,7 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	// 	return new Response('Unsupported Media Type', { status: 415 });
 	// }
 
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request.url);
 
 	// Check if the resource already exists
 	let resource = await bucket.head(resource_path);
@@ -310,13 +314,13 @@ function generate_propfind_response(object: R2Object | null): string {
 	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 	return `
 	<response>
-		<href>${href}</href>
+		<href>${href.split('/').map(encodeURIComponent).join('/')}</href>
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
-			.filter(([_, value]) => value !== undefined)
-			.map(([key, value]) => `<${key}>${value}</${key}>`)
-			.join('\n				')}
+				.filter(([_, value]) => value !== undefined)
+				.map(([key, value]) => `<${key}>${value}</${key}>`)
+				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
@@ -324,7 +328,7 @@ function generate_propfind_response(object: R2Object | null): string {
 }
 
 async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request.url);
 
 	let is_collection: boolean;
 	let page = `<?xml version="1.0" encoding="utf-8"?>
@@ -343,7 +347,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	}
 
 	if (is_collection) {
-		let depth = request.headers.get('Depth') ?? 'infinity';
+		let depth = request.headers.get('Depth') ?? '1';
 		switch (depth) {
 			case '0':
 				break;
@@ -379,7 +383,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 }
 
 async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Response> {
-	const resource_path = make_resource_path(request);
+	const resource_path = make_resource_path(request.url);
 
 	// 检查资源是否存在
 	let object = await bucket.head(resource_path);
@@ -496,14 +500,13 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 }
 
 async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request.url);
 	let dont_overwrite = request.headers.get('Overwrite') === 'F';
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let destination = new URL(destination_header).pathname.slice(1);
-	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	let destination = make_resource_path(destination_header);
 
 	// Check if the parent directory exists
 	let destination_parent = destination
@@ -591,14 +594,13 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 }
 
 async function handle_move(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	let resource_path = make_resource_path(request.url);
 	let overwrite = request.headers.get('Overwrite') === 'T';
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let destination = new URL(destination_header).pathname.slice(1);
-	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	let destination = make_resource_path(destination_header);
 
 	// Check if the parent directory exists
 	let destination_parent = destination
@@ -750,12 +752,12 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 }
 
 function is_authorized(authorization_header: string, username: string, password: string): boolean {
-    const encoder = new TextEncoder();
+	const encoder = new TextEncoder();
 
-    const header = encoder.encode(authorization_header);
-    const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
+	const header = encoder.encode(authorization_header);
+	const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
 
-    return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
+	return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
 }
 
 export default {
