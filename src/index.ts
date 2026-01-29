@@ -173,7 +173,7 @@ function calcContentRange(object: R2ObjectBody) {
 	let rangeOffset = 0;
 	let rangeEnd = object.size - 1;
 	if (object.range) {
-		if ('suffix' in object.range) {
+		if (object.range.suffix != null) {
 			// Case 3: {suffix: number}
 			rangeOffset = object.size - object.range.suffix;
 		} else {
