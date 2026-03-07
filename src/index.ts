@@ -47,7 +47,156 @@ type DavProperties = {
 	getetag: string | undefined;
 	getlastmodified: string | undefined;
 	resourcetype: string;
+	supportedlock: string;
+	lockdiscovery: string;
 };
+
+type LockDetails = {
+	token: string;
+	owner: string | undefined;
+	depth: '0' | 'infinity';
+	timeout: string;
+	expiresAt: number;
+	root: string;
+};
+
+const DEFAULT_LOCK_TIMEOUT = 3600;
+const LOCK_METADATA_KEYS = ['lock_token', 'lock_owner', 'lock_depth', 'lock_timeout', 'lock_expires_at', 'lock_root'];
+
+function escapeXml(value: string): string {
+	return value
+		.replaceAll('&', '&amp;')
+		.replaceAll('<', '&lt;')
+		.replaceAll('>', '&gt;')
+		.replaceAll('"', '&quot;')
+		.replaceAll("'", '&apos;');
+}
+
+function getResourceHref(key: string, isCollection: boolean): string {
+	return `/${key + (isCollection ? '/' : '')}`;
+}
+
+function getSupportedLock(): string {
+	return '<lockentry><lockscope><exclusive /></lockscope><locktype><write /></locktype></lockentry>';
+}
+
+function normalizeLockToken(lockToken: string): string {
+	return lockToken.trim().replace(/^<|>$/g, '').replace(/^(?:urn:uuid:|opaquelocktoken:)/, '');
+}
+
+function getLockDetails(customMetadata: Record<string, string> | undefined): LockDetails | undefined {
+	let token = customMetadata?.lock_token;
+	if (token === undefined) {
+		return undefined;
+	}
+
+	let expiresAt = Number(customMetadata?.lock_expires_at ?? 0);
+	if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
+		expiresAt = Date.now() + DEFAULT_LOCK_TIMEOUT * 1000;
+	}
+	if (expiresAt <= Date.now()) {
+		return undefined;
+	}
+
+	return {
+		token,
+		owner: customMetadata?.lock_owner,
+		depth: customMetadata?.lock_depth === 'infinity' ? 'infinity' : '0',
+		timeout: customMetadata?.lock_timeout ?? `Second-${DEFAULT_LOCK_TIMEOUT}`,
+		expiresAt,
+		root: customMetadata?.lock_root ?? '/',
+	};
+}
+
+function getLockDiscovery(lockDetails: LockDetails | undefined): string {
+	if (lockDetails === undefined) {
+		return '';
+	}
+
+	return `<activelock><locktype><write /></locktype><lockscope><exclusive /></lockscope><depth>${lockDetails.depth}</depth>${lockDetails.owner ? `<owner>${escapeXml(lockDetails.owner)}</owner>` : ''}<timeout>${escapeXml(lockDetails.timeout)}</timeout><locktoken><href>urn:uuid:${escapeXml(lockDetails.token)}</href></locktoken><lockroot><href>${escapeXml(lockDetails.root)}</href></lockroot></activelock>`;
+}
+
+function stripLockMetadata(customMetadata: Record<string, string> | undefined): Record<string, string> {
+	let metadata = customMetadata ? { ...customMetadata } : {};
+	for (const key of LOCK_METADATA_KEYS) {
+		delete metadata[key];
+	}
+	return metadata;
+}
+
+function withLockMetadata(customMetadata: Record<string, string> | undefined, lockDetails: LockDetails): Record<string, string> {
+	return {
+		...stripLockMetadata(customMetadata),
+		lock_token: lockDetails.token,
+		...(lockDetails.owner ? { lock_owner: lockDetails.owner } : {}),
+		lock_depth: lockDetails.depth,
+		lock_timeout: lockDetails.timeout,
+		lock_expires_at: lockDetails.expiresAt.toString(),
+		lock_root: lockDetails.root,
+	};
+}
+
+function parseTimeout(timeoutHeader: string | null): { timeout: string; expiresAt: number } {
+	if (timeoutHeader === null) {
+		return {
+			timeout: `Second-${DEFAULT_LOCK_TIMEOUT}`,
+			expiresAt: Date.now() + DEFAULT_LOCK_TIMEOUT * 1000,
+		};
+	}
+
+	for (const item of timeoutHeader.split(',').map((value) => value.trim())) {
+		if (item.toLowerCase() === 'infinite') {
+			return {
+				timeout: 'Infinite',
+				expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000,
+			};
+		}
+
+		let seconds = Number(item.match(/^Second-(\d+)$/i)?.[1] ?? NaN);
+		if (Number.isFinite(seconds) && seconds > 0) {
+			seconds = Math.min(seconds, 365 * 24 * 60 * 60);
+			return {
+				timeout: `Second-${seconds}`,
+				expiresAt: Date.now() + seconds * 1000,
+			};
+		}
+	}
+
+	return {
+		timeout: `Second-${DEFAULT_LOCK_TIMEOUT}`,
+		expiresAt: Date.now() + DEFAULT_LOCK_TIMEOUT * 1000,
+	};
+}
+
+function getRequestLockTokens(request: Request): string[] {
+	let lockTokens: string[] = [];
+	let directLockToken = request.headers.get('Lock-Token');
+	if (directLockToken) {
+		lockTokens.push(normalizeLockToken(directLockToken));
+	}
+
+	let ifHeader = request.headers.get('If');
+	if (ifHeader) {
+		for (const match of ifHeader.matchAll(/<([^>]+)>/g)) {
+			let token = normalizeLockToken(match[1]);
+			if (token !== '') {
+				lockTokens.push(token);
+			}
+		}
+	}
+
+	return [...new Set(lockTokens)];
+}
+
+function extractLockOwner(body: string): string | undefined {
+	let owner = body.match(/<owner(?:\s[^>]*)?>([\s\S]*?)<\/owner>/i)?.[1];
+	if (owner === undefined) {
+		return undefined;
+	}
+
+	owner = owner.replace(/<[^>]+>/g, '').trim();
+	return owner === '' ? undefined : owner;
+}
 
 function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	if (object === null || object === undefined) {
@@ -60,9 +209,13 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 			getetag: undefined,
 			getlastmodified: new Date().toUTCString(),
 			resourcetype: '<collection />',
+			supportedlock: getSupportedLock(),
+			lockdiscovery: '',
 		};
 	}
 
+	let isCollection = object.customMetadata?.resourcetype === '<collection />';
+	let lockDetails = getLockDetails(object.customMetadata);
 	return {
 		creationdate: object.uploaded.toUTCString(),
 		displayname: object.httpMetadata?.contentDisposition,
@@ -72,6 +225,14 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 		getetag: object.etag,
 		getlastmodified: object.uploaded.toUTCString(),
 		resourcetype: object.customMetadata?.resourcetype ?? '',
+		supportedlock: getSupportedLock(),
+		lockdiscovery:
+			lockDetails === undefined
+				? ''
+				: getLockDiscovery({
+						...lockDetails,
+						root: getResourceHref(object.key, isCollection),
+				  }),
 	};
 }
 
@@ -79,6 +240,33 @@ function make_resource_path(request: Request): string {
 	let path = new URL(request.url).pathname.slice(1);
 	path = path.endsWith('/') ? path.slice(0, -1) : path;
 	return path;
+}
+
+async function assertLockPermission(request: Request, bucket: R2Bucket, resourcePath: string): Promise<Response | null> {
+	let lockTokens = getRequestLockTokens(request);
+	let candidates: string[] = [];
+
+	for (let current = resourcePath; current !== ''; current = current.split('/').slice(0, -1).join('/')) {
+		candidates.push(current);
+	}
+
+	for (const candidate of candidates) {
+		let object = await bucket.head(candidate);
+		let lockDetails = getLockDetails(object?.customMetadata);
+		if (lockDetails === undefined) {
+			continue;
+		}
+
+		if (candidate !== resourcePath && lockDetails.depth !== 'infinity') {
+			continue;
+		}
+
+		if (!lockTokens.includes(lockDetails.token)) {
+			return new Response('Locked', { status: 423 });
+		}
+	}
+
+	return null;
 }
 
 async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
@@ -193,6 +381,11 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 	}
 
 	let resource_path = make_resource_path(request);
+	let lockResponse = await assertLockPermission(request, bucket, resource_path);
+	if (lockResponse !== null) {
+		return lockResponse;
+	}
+	let existing = await bucket.head(resource_path);
 
 	// Check if the parent directory exists
 	let dirpath = resource_path.split('/').slice(0, -1).join('/');
@@ -207,12 +400,17 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 	await bucket.put(resource_path, body, {
 		onlyIf: request.headers,
 		httpMetadata: request.headers,
+		customMetadata: existing?.customMetadata,
 	});
 	return new Response('', { status: 201 });
 }
 
 async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
+	let lockResponse = await assertLockPermission(request, bucket, resource_path);
+	if (lockResponse !== null) {
+		return lockResponse;
+	}
 
 	if (resource_path === '') {
 		let r2_objects,
@@ -269,6 +467,10 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	// }
 
 	let resource_path = make_resource_path(request);
+	let lockResponse = await assertLockPermission(request, bucket, resource_path);
+	if (lockResponse !== null) {
+		return lockResponse;
+	}
 
 	// Check if the resource already exists
 	let resource = await bucket.head(resource_path);
@@ -380,6 +582,10 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 
 async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Response> {
 	const resource_path = make_resource_path(request);
+	let lockResponse = await assertLockPermission(request, bucket, resource_path);
+	if (lockResponse !== null) {
+		return lockResponse;
+	}
 
 	// 检查资源是否存在
 	let object = await bucket.head(resource_path);
@@ -438,10 +644,16 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 
 	// 更新元数据
 	for (const propName in setProperties) {
+		if (LOCK_METADATA_KEYS.includes(propName) || propName === 'supportedlock' || propName === 'lockdiscovery') {
+			continue;
+		}
 		customMetadata[propName] = setProperties[propName];
 	}
 
 	for (const propName of removeProperties) {
+		if (LOCK_METADATA_KEYS.includes(propName) || propName === 'supportedlock' || propName === 'lockdiscovery') {
+			continue;
+		}
 		delete customMetadata[propName];
 	}
 
@@ -504,6 +716,10 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	}
 	let destination = new URL(destination_header).pathname.slice(1);
 	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	let lockResponse = await assertLockPermission(request, bucket, destination);
+	if (lockResponse !== null) {
+		return lockResponse;
+	}
 
 	// Check if the parent directory exists
 	let destination_parent = destination
@@ -539,7 +755,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 					if (src !== null) {
 						await bucket.put(target, src.body, {
 							httpMetadata: object.httpMetadata,
-							customMetadata: object.customMetadata,
+							customMetadata: stripLockMetadata(object.customMetadata),
 						});
 					}
 				};
@@ -561,7 +777,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 				}
 				await bucket.put(destination, object.body, {
 					httpMetadata: object.httpMetadata,
-					customMetadata: object.customMetadata,
+					customMetadata: stripLockMetadata(object.customMetadata),
 				});
 				if (destination_exists) {
 					return new Response(null, { status: 204 });
@@ -580,7 +796,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 		}
 		await bucket.put(destination, src.body, {
 			httpMetadata: src.httpMetadata,
-			customMetadata: src.customMetadata,
+			customMetadata: stripLockMetadata(src.customMetadata),
 		});
 		if (destination_exists) {
 			return new Response(null, { status: 204 });
@@ -599,6 +815,14 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 	let destination = new URL(destination_header).pathname.slice(1);
 	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	let sourceLockResponse = await assertLockPermission(request, bucket, resource_path);
+	if (sourceLockResponse !== null) {
+		return sourceLockResponse;
+	}
+	let destinationLockResponse = await assertLockPermission(request, bucket, destination);
+	if (destinationLockResponse !== null) {
+		return destinationLockResponse;
+	}
 
 	// Check if the parent directory exists
 	let destination_parent = destination
@@ -696,8 +920,106 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 }
 
-const DAV_CLASS = '1';
-const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'GET', 'HEAD', 'PUT', 'DELETE', 'COPY', 'MOVE'];
+async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+	let depth: '0' | 'infinity' = request.headers.get('Depth') === 'infinity' ? 'infinity' : '0';
+	let { timeout, expiresAt } = parseTimeout(request.headers.get('Timeout'));
+	let body = await request.text();
+	if (/<shared\b/i.test(body)) {
+		return new Response('Not Implemented', { status: 501 });
+	}
+	if (body !== '' && !/<write\b/i.test(body)) {
+		return new Response('Bad Request', { status: 400 });
+	}
+	let owner = extractLockOwner(body);
+
+	let resource = await bucket.head(resource_path);
+	let existingLock = getLockDetails(resource?.customMetadata);
+	if (existingLock !== undefined) {
+		if (!getRequestLockTokens(request).includes(existingLock.token)) {
+			return new Response('Locked', { status: 423 });
+		}
+	} else if (resource === null) {
+		if (request.url.endsWith('/')) {
+			return new Response('Conflict', { status: 409 });
+		}
+
+		await bucket.put(resource_path, new Uint8Array(), {
+			customMetadata: {},
+		});
+		resource = await bucket.head(resource_path);
+	}
+
+	if (resource === null) {
+		return new Response('Not Found', { status: 404 });
+	}
+	if (resource.customMetadata?.resourcetype === '<collection />' && depth !== 'infinity') {
+		depth = '0';
+	}
+
+	let lockDetails: LockDetails = {
+		token: existingLock?.token ?? crypto.randomUUID(),
+		owner: owner ?? existingLock?.owner,
+		depth,
+		timeout,
+		expiresAt,
+		root: getResourceHref(resource.key, resource.customMetadata?.resourcetype === '<collection />'),
+	};
+
+	let source = await bucket.get(resource.key);
+	if (source === null) {
+		return new Response('Not Found', { status: 404 });
+	}
+
+	await bucket.put(resource.key, source.body, {
+		httpMetadata: source.httpMetadata,
+		customMetadata: withLockMetadata(resource.customMetadata, lockDetails),
+	});
+
+	return new Response(
+		`<?xml version="1.0" encoding="utf-8"?>\n<prop xmlns="DAV:"><lockdiscovery>${getLockDiscovery(lockDetails)}</lockdiscovery></prop>`,
+		{
+			status: existingLock ? 200 : 201,
+			headers: {
+				'Content-Type': 'application/xml; charset="utf-8"',
+				'Lock-Token': `<urn:uuid:${lockDetails.token}>`,
+			},
+		},
+	);
+}
+
+async function handle_unlock(request: Request, bucket: R2Bucket): Promise<Response> {
+	let resource_path = make_resource_path(request);
+	let resource = await bucket.head(resource_path);
+	if (resource === null) {
+		return new Response('Not Found', { status: 404 });
+	}
+
+	let lockToken = request.headers.get('Lock-Token');
+	if (lockToken === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
+
+	let lockDetails = getLockDetails(resource.customMetadata);
+	if (lockDetails === undefined || normalizeLockToken(lockToken) !== lockDetails.token) {
+		return new Response('Conflict', { status: 409 });
+	}
+
+	let source = await bucket.get(resource.key);
+	if (source === null) {
+		return new Response('Not Found', { status: 404 });
+	}
+
+	await bucket.put(resource.key, source.body, {
+		httpMetadata: source.httpMetadata,
+		customMetadata: stripLockMetadata(resource.customMetadata),
+	});
+
+	return new Response(null, { status: 204 });
+}
+
+const DAV_CLASS = '1, 3';
+const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'GET', 'HEAD', 'PUT', 'DELETE', 'COPY', 'MOVE', 'LOCK', 'UNLOCK'];
 
 async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
 	switch (request.method) {
@@ -736,6 +1058,12 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 		}
 		case 'MOVE': {
 			return await handle_move(request, bucket);
+		}
+		case 'LOCK': {
+			return await handle_lock(request, bucket);
+		}
+		case 'UNLOCK': {
+			return await handle_unlock(request, bucket);
 		}
 		default: {
 			return new Response('Method Not Allowed', {
@@ -781,11 +1109,11 @@ export default {
 		response.headers.set('Access-Control-Allow-Methods', SUPPORT_METHODS.join(', '));
 		response.headers.set(
 			'Access-Control-Allow-Headers',
-			['authorization', 'content-type', 'depth', 'overwrite', 'destination', 'range'].join(', '),
+			['authorization', 'content-type', 'depth', 'overwrite', 'destination', 'range', 'if', 'lock-token', 'timeout'].join(', '),
 		);
 		response.headers.set(
 			'Access-Control-Expose-Headers',
-			['content-type', 'content-length', 'dav', 'etag', 'last-modified', 'location', 'date', 'content-range'].join(
+			['content-type', 'content-length', 'dav', 'etag', 'last-modified', 'location', 'date', 'content-range', 'lock-token'].join(
 				', ',
 			),
 		);
