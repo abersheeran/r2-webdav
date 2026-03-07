@@ -4,6 +4,8 @@
 
 Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
+Currently the server advertises WebDAV Class 1 support.
+
 ## Usage
 
 Change wrangler.toml to your own.

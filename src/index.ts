@@ -696,7 +696,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 }
 
-const DAV_CLASS = '1, 3';
+const DAV_CLASS = '1';
 const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'GET', 'HEAD', 'PUT', 'DELETE', 'COPY', 'MOVE'];
 
 async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
