@@ -61,6 +61,8 @@ type LockDetails = {
 };
 
 const DEFAULT_LOCK_TIMEOUT = 3600;
+const MAX_LOCK_TIMEOUT = 365 * 24 * 60 * 60;
+const VALID_LOCK_DEPTHS = ['0', 'infinity'] as const;
 const LOCK_METADATA_KEYS = ['lock_token', 'lock_owner', 'lock_depth', 'lock_timeout', 'lock_expires_at', 'lock_root'];
 
 function escapeXml(value: string): string {
@@ -73,11 +75,24 @@ function escapeXml(value: string): string {
 }
 
 function getResourceHref(key: string, isCollection: boolean): string {
+	if (key === '') {
+		return '/';
+	}
 	return `/${key + (isCollection ? '/' : '')}`;
 }
 
 function getSupportedLock(): string {
 	return '<lockentry><lockscope><exclusive /></lockscope><locktype><write /></locktype></lockentry>';
+}
+
+function determineLockDepth(
+	resourceType: string | undefined,
+	depthHeader: (typeof VALID_LOCK_DEPTHS)[number] | null,
+): '0' | 'infinity' {
+	if (resourceType === '<collection />') {
+		return depthHeader ?? 'infinity';
+	}
+	return depthHeader === 'infinity' ? 'infinity' : '0';
 }
 
 function normalizeLockToken(lockToken: string): string {
@@ -136,6 +151,19 @@ function withLockMetadata(customMetadata: Record<string, string> | undefined, lo
 	};
 }
 
+function getPreservedCustomMetadata(customMetadata: Record<string, string> | undefined): Record<string, string> {
+	let lockDetails = getLockDetails(customMetadata);
+	if (lockDetails === undefined) {
+		return stripLockMetadata(customMetadata);
+	}
+	return withLockMetadata(customMetadata, lockDetails);
+}
+
+function isProtectedProperty(propName: string): boolean {
+	let localPropName = propName.split(':').pop() ?? propName;
+	return LOCK_METADATA_KEYS.includes(localPropName) || localPropName === 'supportedlock' || localPropName === 'lockdiscovery';
+}
+
 function parseTimeout(timeoutHeader: string | null): { timeout: string; expiresAt: number } {
 	if (timeoutHeader === null) {
 		return {
@@ -148,13 +176,13 @@ function parseTimeout(timeoutHeader: string | null): { timeout: string; expiresA
 		if (item.toLowerCase() === 'infinite') {
 			return {
 				timeout: 'Infinite',
-				expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000,
+				expiresAt: Date.now() + MAX_LOCK_TIMEOUT * 1000,
 			};
 		}
 
 		let seconds = Number(item.match(/^Second-(\d+)$/i)?.[1] ?? NaN);
 		if (Number.isFinite(seconds) && seconds > 0) {
-			seconds = Math.min(seconds, 365 * 24 * 60 * 60);
+			seconds = Math.min(seconds, MAX_LOCK_TIMEOUT);
 			return {
 				timeout: `Second-${seconds}`,
 				expiresAt: Date.now() + seconds * 1000,
@@ -194,7 +222,7 @@ function extractLockOwner(body: string): string | undefined {
 		return undefined;
 	}
 
-	owner = owner.replace(/<[^>]+>/g, '').trim();
+	owner = owner.trim();
 	return owner === '' ? undefined : owner;
 }
 
@@ -400,7 +428,7 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 	await bucket.put(resource_path, body, {
 		onlyIf: request.headers,
 		httpMetadata: request.headers,
-		customMetadata: existing?.customMetadata,
+		customMetadata: getPreservedCustomMetadata(existing?.customMetadata),
 	});
 	return new Response('', { status: 201 });
 }
@@ -640,18 +668,18 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	await new HTMLRewriter().on('propertyupdate', new PropHandler()).transform(new Response(body)).arrayBuffer();
 
 	// 复制原有的自定义元数据
-	const customMetadata = object.customMetadata ? { ...object.customMetadata } : {};
+	const customMetadata = getPreservedCustomMetadata(object.customMetadata);
 
 	// 更新元数据
 	for (const propName in setProperties) {
-		if (LOCK_METADATA_KEYS.includes(propName) || propName === 'supportedlock' || propName === 'lockdiscovery') {
+		if (isProtectedProperty(propName)) {
 			continue;
 		}
 		customMetadata[propName] = setProperties[propName];
 	}
 
 	for (const propName of removeProperties) {
-		if (LOCK_METADATA_KEYS.includes(propName) || propName === 'supportedlock' || propName === 'lockdiscovery') {
+		if (isProtectedProperty(propName)) {
 			continue;
 		}
 		delete customMetadata[propName];
@@ -866,7 +894,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 					if (src !== null) {
 						await bucket.put(target, src.body, {
 							httpMetadata: object.httpMetadata,
-							customMetadata: object.customMetadata,
+							customMetadata: getPreservedCustomMetadata(object.customMetadata),
 						});
 						await bucket.delete(object.key);
 					}
@@ -889,7 +917,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 				}
 				await bucket.put(destination, object.body, {
 					httpMetadata: object.httpMetadata,
-					customMetadata: object.customMetadata,
+					customMetadata: getPreservedCustomMetadata(object.customMetadata),
 				});
 				await bucket.delete(resource.key);
 				if (destination_exists) {
@@ -909,7 +937,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		}
 		await bucket.put(destination, src.body, {
 			httpMetadata: src.httpMetadata,
-			customMetadata: src.customMetadata,
+			customMetadata: getPreservedCustomMetadata(src.customMetadata),
 		});
 		await bucket.delete(resource.key);
 		if (destination_exists) {
@@ -922,7 +950,10 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 
 async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
-	let depth: '0' | 'infinity' = request.headers.get('Depth') === 'infinity' ? 'infinity' : '0';
+	let depthHeader = request.headers.get('Depth');
+	if (depthHeader !== null && !VALID_LOCK_DEPTHS.includes(depthHeader as (typeof VALID_LOCK_DEPTHS)[number])) {
+		return new Response('Bad Request', { status: 400 });
+	}
 	let { timeout, expiresAt } = parseTimeout(request.headers.get('Timeout'));
 	let body = await request.text();
 	if (/<shared\b/i.test(body)) {
@@ -953,9 +984,10 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
 	}
-	if (resource.customMetadata?.resourcetype === '<collection />' && depth !== 'infinity') {
-		depth = '0';
-	}
+	let depth = determineLockDepth(
+		resource.customMetadata?.resourcetype,
+		depthHeader as (typeof VALID_LOCK_DEPTHS)[number] | null,
+	);
 
 	let lockDetails: LockDetails = {
 		token: existingLock?.token ?? crypto.randomUUID(),
