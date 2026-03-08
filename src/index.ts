@@ -93,6 +93,24 @@ function getResourceHref(key: string, isCollection: boolean): string {
 	return encodeHrefPath(`/${key + (isCollection ? '/' : '')}`);
 }
 
+function decodeResourcePath(pathname: string): string {
+	let resourcePath = pathname.slice(1);
+	resourcePath = resourcePath.endsWith('/') ? resourcePath.slice(0, -1) : resourcePath;
+	if (resourcePath === '') {
+		return '';
+	}
+	return resourcePath
+		.split('/')
+		.map((segment) => {
+			try {
+				return decodeURIComponent(segment);
+			} catch {
+				return segment;
+			}
+		})
+		.join('/');
+}
+
 function getParentPath(resourcePath: string): string {
 	let normalizedPath = resourcePath.endsWith('/') ? resourcePath.slice(0, -1) : resourcePath;
 	return normalizedPath.split('/').slice(0, -1).join('/');
@@ -109,8 +127,7 @@ async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Pr
 
 function parseDestinationPath(destinationHeader: string): string | null {
 	try {
-		let destination = new URL(destinationHeader).pathname.slice(1);
-		return destination.endsWith('/') ? destination.slice(0, -1) : destination;
+		return decodeResourcePath(new URL(destinationHeader).pathname);
 	} catch {
 		return null;
 	}
@@ -317,9 +334,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 }
 
 function make_resource_path(request: Request): string {
-	let path = new URL(request.url).pathname.slice(1);
-	path = path.endsWith('/') ? path.slice(0, -1) : path;
-	return path;
+	return decodeResourcePath(new URL(request.url).pathname);
 }
 
 async function assertLockPermission(
@@ -432,6 +447,7 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			return new Response(object.body, {
 				status: rangeRequested ? 206 : 200,
 				headers: {
+					'Accept-Ranges': 'bytes',
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
 					'Content-Length': contentLength.toString(),
 					...(rangeRequested ? { 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` } : {}),
@@ -511,7 +527,7 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		httpMetadata: request.headers,
 		customMetadata: getPreservedCustomMetadata(existing?.customMetadata),
 	});
-	return new Response('', { status: 201 });
+	return existing === null ? new Response('', { status: 201 }) : new Response(null, { status: 204 });
 }
 
 async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
@@ -675,7 +691,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				}
 				break;
 			default: {
-				return new Response('Forbidden', { status: 403 });
+				return new Response('Bad Request', { status: 400 });
 			}
 		}
 	}
@@ -796,7 +812,7 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 		}
 		responseXML += `
     <response>
-        <href>/${object.key}</href>
+        <href>${escapeXml(getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />'))}</href>
         <propstat>
             <prop>
                 <${propName} />
