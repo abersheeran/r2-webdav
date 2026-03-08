@@ -992,6 +992,10 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 		return new Response('Bad Request', { status: 400 });
 	}
 	let owner = extractLockOwner(body);
+	let lockResponse = await assertLockPermission(request, bucket, resource_path);
+	if (lockResponse !== null) {
+		return lockResponse;
+	}
 
 	let resource = await bucket.head(resource_path);
 	let existingLock = getLockDetails(resource?.customMetadata);
@@ -1066,6 +1070,10 @@ async function handle_unlock(request: Request, bucket: R2Bucket): Promise<Respon
 	let lockToken = request.headers.get('Lock-Token');
 	if (lockToken === null) {
 		return new Response('Bad Request', { status: 400 });
+	}
+	let lockResponse = await assertLockPermission(request, bucket, resource_path);
+	if (lockResponse !== null) {
+		return lockResponse;
 	}
 
 	let lockDetails = getLockDetails(resource.customMetadata);
