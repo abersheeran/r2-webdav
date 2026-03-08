@@ -65,6 +65,7 @@ const MAX_LOCK_TIMEOUT = 365 * 24 * 60 * 60;
 const VALID_LOCK_DEPTHS = ['0', 'infinity'] as const;
 const LOCK_METADATA_KEYS = ['lock_token', 'lock_owner', 'lock_depth', 'lock_timeout', 'lock_expires_at', 'lock_root'];
 const INTERNAL_DELETE_FORWARD_HEADERS = ['If', 'Lock-Token'] as const;
+const RAW_XML_DAV_PROPERTIES = new Set(['resourcetype', 'supportedlock', 'lockdiscovery']);
 
 function escapeXml(value: string): string {
 	return value
@@ -76,10 +77,48 @@ function escapeXml(value: string): string {
 }
 
 function getResourceHref(key: string, isCollection: boolean): string {
+	const encodeHrefPath = (href: string): string => {
+		if (href === '/') {
+			return '/';
+		}
+		return href
+			.split('/')
+			.map((segment, index) => (index === 0 ? segment : encodeURIComponent(segment)))
+			.join('/');
+	};
+
 	if (key === '') {
 		return '/';
 	}
-	return `/${key + (isCollection ? '/' : '')}`;
+	return encodeHrefPath(`/${key + (isCollection ? '/' : '')}`);
+}
+
+function getParentPath(resourcePath: string): string {
+	let normalizedPath = resourcePath.endsWith('/') ? resourcePath.slice(0, -1) : resourcePath;
+	return normalizedPath.split('/').slice(0, -1).join('/');
+}
+
+async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Promise<boolean> {
+	if (resourcePath === '') {
+		return true;
+	}
+
+	let resource = await bucket.head(resourcePath);
+	return resource?.customMetadata?.resourcetype === '<collection />';
+}
+
+function parseDestinationPath(destinationHeader: string): string | null {
+	try {
+		let destination = new URL(destinationHeader).pathname.slice(1);
+		return destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	} catch {
+		return null;
+	}
+}
+
+function renderDavProperty(propName: string, value: string): string {
+	let content = RAW_XML_DAV_PROPERTIES.has(propName) ? value : escapeXml(value);
+	return `<${propName}>${content}</${propName}>`;
 }
 
 function getSupportedLock(): string {
@@ -360,8 +399,10 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			if (object.key === resource_path) {
 				continue;
 			}
-			let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length)}</a><br>`;
+			let href = getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
+			page += `<a href="${escapeXml(href)}">${escapeXml(
+				object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length),
+			)}</a><br>`;
 		}
 		// 定义模板
 		var pageSource = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>R2Storage</title><style>*{box-sizing:border-box;}body{padding:10px;font-family:'Segoe UI','Circular','Roboto','Lato','Helvetica Neue','Arial Rounded MT Bold','sans-serif';}a{display:inline-block;width:100%;color:#000;text-decoration:none;padding:5px 10px;cursor:pointer;border-radius:5px;}a:hover{background-color:#60C590;color:white;}a[href="../"]{background-color:#cbd5e1;}</style></head><body><h1>R2 Storage</h1><div>${page}</div></body></html>`;
@@ -387,12 +428,13 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		} else {
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
 			const contentLength = rangeEnd - rangeOffset + 1;
+			const rangeRequested = object.range !== undefined;
 			return new Response(object.body, {
-				status: object.range && contentLength !== object.size ? 206 : 200,
+				status: rangeRequested ? 206 : 200,
 				headers: {
 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
 					'Content-Length': contentLength.toString(),
-					...{ 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` },
+					...(rangeRequested ? { 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` } : {}),
 					...(object.httpMetadata?.contentDisposition
 						? {
 								'Content-Disposition': object.httpMetadata.contentDisposition,
@@ -455,7 +497,7 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 	let existing = await bucket.head(resource_path);
 
 	// Check if the parent directory exists
-	let dirpath = resource_path.split('/').slice(0, -1).join('/');
+	let dirpath = getParentPath(resource_path);
 	if (dirpath !== '') {
 		let dir = await bucket.head(dirpath);
 		if (!(dir && dir.customMetadata?.resourcetype === '<collection />')) {
@@ -547,9 +589,8 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	}
 
 	// Check if the parent directory exists
-	let parent_dir = resource_path.split('/').slice(0, -1).join('/');
-
-	if (parent_dir !== '' && !(await bucket.head(parent_dir))) {
+	let parent_dir = getParentPath(resource_path);
+	if (!(await hasCollectionResource(bucket, parent_dir))) {
 		return new Response('Conflict', { status: 409 });
 	}
 
@@ -569,7 +610,7 @@ function generate_propfind_response(object: R2Object | null): string {
 			<prop>
 			${Object.entries(fromR2Object(null))
 				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => `<${key}>${value}</${key}>`)
+				.map(([key, value]) => renderDavProperty(key, value))
 				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
@@ -577,15 +618,15 @@ function generate_propfind_response(object: R2Object | null): string {
 	</response>`;
 	}
 
-	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+	let href = getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
 	return `
 	<response>
-		<href>${href}</href>
+		<href>${escapeXml(href)}</href>
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
 				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => `<${key}>${value}</${key}>`)
+				.map(([key, value]) => renderDavProperty(key, value))
 				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
@@ -799,19 +840,18 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let destination = new URL(destination_header).pathname.slice(1);
-	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	let destination = parseDestinationPath(destination_header);
+	if (destination === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
 	let lockResponse = await assertLockPermission(request, bucket, destination);
 	if (lockResponse !== null) {
 		return lockResponse;
 	}
 
 	// Check if the parent directory exists
-	let destination_parent = destination
-		.split('/')
-		.slice(0, destination.endsWith('/') ? -2 : -1)
-		.join('/');
-	if (destination_parent !== '' && !(await bucket.head(destination_parent))) {
+	let destination_parent = getParentPath(destination);
+	if (!(await hasCollectionResource(bucket, destination_parent))) {
 		return new Response('Conflict', { status: 409 });
 	}
 
@@ -898,8 +938,10 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let destination = new URL(destination_header).pathname.slice(1);
-	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	let destination = parseDestinationPath(destination_header);
+	if (destination === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
 	let sourceLockResponse = await assertLockPermission(request, bucket, resource_path);
 	if (sourceLockResponse !== null) {
 		return sourceLockResponse;
@@ -910,11 +952,8 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 	}
 
 	// Check if the parent directory exists
-	let destination_parent = destination
-		.split('/')
-		.slice(0, destination.endsWith('/') ? -2 : -1)
-		.join('/');
-	if (destination_parent !== '' && !(await bucket.head(destination_parent))) {
+	let destination_parent = getParentPath(destination);
+	if (!(await hasCollectionResource(bucket, destination_parent))) {
 		return new Response('Conflict', { status: 409 });
 	}
 
@@ -1048,6 +1087,9 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 			return new Response('Locked', { status: 423 });
 		}
 	} else if (resource === null) {
+		if (!(await hasCollectionResource(bucket, getParentPath(resource_path)))) {
+			return new Response('Conflict', { status: 409 });
+		}
 		if (request.url.endsWith('/')) {
 			return new Response('Conflict', { status: 409 });
 		}
