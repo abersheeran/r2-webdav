@@ -15,5 +15,8 @@
 		"typescript": "^5.0.4",
 		"wrangler": "^4.15.2"
 	},
-	"type": "module"
+	"type": "module",
+	"dependencies": {
+		"@xmldom/xmldom": "^0.8.11"
+	}
 }

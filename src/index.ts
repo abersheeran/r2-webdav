@@ -8,6 +8,8 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
+import { DOMParser } from '@xmldom/xmldom';
+
 export interface Env {
 	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
 	bucket: R2Bucket;
@@ -60,12 +62,38 @@ type LockDetails = {
 	root: string;
 };
 
+type DeadProperty = {
+	namespaceURI: string;
+	localName: string;
+	prefix: string | null;
+	valueXml: string;
+};
+
+type PropfindRequest =
+	| {
+			mode: 'allprop';
+	  }
+	| {
+			mode: 'propname';
+	  }
+	| {
+			mode: 'prop';
+			properties: DeadProperty[];
+	  };
+
+type ProppatchOperation = {
+	action: 'set' | 'remove';
+	property: DeadProperty;
+};
+
 const DEFAULT_LOCK_TIMEOUT = 3600;
 const MAX_LOCK_TIMEOUT = 365 * 24 * 60 * 60;
 const VALID_LOCK_DEPTHS = ['0', 'infinity'] as const;
 const LOCK_METADATA_KEYS = ['lock_token', 'lock_owner', 'lock_depth', 'lock_timeout', 'lock_expires_at', 'lock_root'];
 const INTERNAL_DELETE_FORWARD_HEADERS = ['If', 'Lock-Token'] as const;
 const RAW_XML_DAV_PROPERTIES = new Set(['resourcetype', 'supportedlock', 'lockdiscovery']);
+const DAV_NAMESPACE = 'DAV:';
+const DEAD_PROPERTY_PREFIX = 'dead_property:';
 
 function escapeXml(value: string): string {
 	return value
@@ -166,6 +194,153 @@ function renderDavProperty(propName: string, value: string): string {
 	return `<${propName}>${content}</${propName}>`;
 }
 
+function serializeNodeChildren(node: Node): string {
+	let xml = '';
+	for (let child = node.firstChild; child !== null; child = child.nextSibling) {
+		xml += child.toString();
+	}
+	return xml;
+}
+
+function getDeadPropertyKey(namespaceURI: string, localName: string): string {
+	return `${DEAD_PROPERTY_PREFIX}${encodeURIComponent(namespaceURI)}:${encodeURIComponent(localName)}`;
+}
+
+function getDeadProperty(
+	metadata: Record<string, string> | undefined,
+	namespaceURI: string,
+	localName: string,
+): DeadProperty | null {
+	let value = metadata?.[getDeadPropertyKey(namespaceURI, localName)];
+	if (value === undefined) {
+		return null;
+	}
+	return JSON.parse(value) as DeadProperty;
+}
+
+function getDeadProperties(metadata: Record<string, string> | undefined): DeadProperty[] {
+	if (metadata === undefined) {
+		return [];
+	}
+	return Object.entries(metadata)
+		.filter(([key]) => key.startsWith(DEAD_PROPERTY_PREFIX))
+		.map(([, value]) => JSON.parse(value) as DeadProperty);
+}
+
+function renderPropertyElement(property: DeadProperty): string {
+	let qualifiedName = property.prefix ? `${property.prefix}:${property.localName}` : property.localName;
+	let namespaceDeclaration =
+		property.namespaceURI === ''
+			? ' xmlns=""'
+			: property.prefix
+				? ` xmlns:${property.prefix}="${escapeXml(property.namespaceURI)}"`
+				: ` xmlns="${escapeXml(property.namespaceURI)}"`;
+	return `<${qualifiedName}${namespaceDeclaration}>${property.valueXml}</${qualifiedName}>`;
+}
+
+function renderEmptyPropertyElement(property: DeadProperty): string {
+	let qualifiedName = property.prefix ? `${property.prefix}:${property.localName}` : property.localName;
+	let namespaceDeclaration =
+		property.namespaceURI === ''
+			? ' xmlns=""'
+			: property.prefix
+				? ` xmlns:${property.prefix}="${escapeXml(property.namespaceURI)}"`
+				: ` xmlns="${escapeXml(property.namespaceURI)}"`;
+	return `<${qualifiedName}${namespaceDeclaration} />`;
+}
+
+function getElementProperty(element: Element): DeadProperty | null {
+	if (element.prefix && (element.namespaceURI === null || element.namespaceURI === '')) {
+		return null;
+	}
+	return {
+		namespaceURI: element.namespaceURI ?? '',
+		localName: element.localName,
+		prefix: element.prefix,
+		valueXml: serializeNodeChildren(element),
+	};
+}
+
+function parseXmlDocument(body: string): Document | null {
+	let errors: string[] = [];
+	let document = new DOMParser({
+		errorHandler: {
+			warning: () => {},
+			error: (message) => errors.push(message),
+			fatalError: (message) => errors.push(message),
+		},
+	}).parseFromString(body, 'application/xml');
+	if (errors.length > 0) {
+		return null;
+	}
+	return document;
+}
+
+function getChildElements(element: Element): Element[] {
+	let children: Element[] = [];
+	for (let child = element.firstChild; child !== null; child = child.nextSibling) {
+		if (child.nodeType === child.ELEMENT_NODE) {
+			children.push(child as Element);
+		}
+	}
+	return children;
+}
+
+function parsePropfindRequest(body: string): PropfindRequest | null {
+	if (body.trim() === '') {
+		return { mode: 'allprop' };
+	}
+	let document = parseXmlDocument(body);
+	if (document === null || document.documentElement.localName.toLowerCase() !== 'propfind') {
+		return null;
+	}
+	let propfindChildren = getChildElements(document.documentElement);
+	if (propfindChildren.some((child) => child.localName.toLowerCase() === 'propname')) {
+		return { mode: 'propname' };
+	}
+	let propElement = propfindChildren.find((child) => child.localName.toLowerCase() === 'prop');
+	if (propElement !== undefined) {
+		let properties = getChildElements(propElement).map(getElementProperty);
+		if (properties.some((property) => property === null)) {
+			return null;
+		}
+		return {
+			mode: 'prop',
+			properties: properties as DeadProperty[],
+		};
+	}
+	if (propfindChildren.some((child) => child.localName.toLowerCase() === 'allprop')) {
+		return { mode: 'allprop' };
+	}
+	return null;
+}
+
+function parseProppatchRequest(body: string): { operations: ProppatchOperation[] } | null {
+	let document = parseXmlDocument(body);
+	if (document === null || document.documentElement.localName.toLowerCase() !== 'propertyupdate') {
+		return null;
+	}
+	let operations: ProppatchOperation[] = [];
+	for (const actionElement of getChildElements(document.documentElement)) {
+		let action = actionElement.localName.toLowerCase();
+		if (action !== 'set' && action !== 'remove') {
+			continue;
+		}
+		let propElement = getChildElements(actionElement).find((child) => child.localName.toLowerCase() === 'prop');
+		if (propElement === undefined) {
+			continue;
+		}
+		for (const propertyElement of getChildElements(propElement)) {
+			let property = getElementProperty(propertyElement);
+			if (property === null) {
+				return null;
+			}
+			operations.push({ action, property });
+		}
+	}
+	return { operations };
+}
+
 function getSupportedLock(): string {
 	return '<lockentry><lockscope><exclusive /></lockscope><locktype><write /></locktype></lockentry>';
 }
@@ -250,8 +425,8 @@ function getPreservedCustomMetadata(customMetadata: Record<string, string> | und
 	return withLockMetadata(customMetadata, lockDetails);
 }
 
-function isProtectedProperty(propName: string): boolean {
-	let localPropName = propName.split(':').pop() ?? propName;
+function isProtectedProperty(propName: string | DeadProperty): boolean {
+	let localPropName = typeof propName === 'string' ? (propName.split(':').pop() ?? propName) : propName.localName;
 	return (
 		LOCK_METADATA_KEYS.includes(localPropName) || localPropName === 'supportedlock' || localPropName === 'lockdiscovery'
 	);
@@ -313,6 +488,22 @@ function getRequestLockTokens(request: Request): string[] {
 	return [...new Set(lockTokens)];
 }
 
+function hasAlwaysFalseIfCondition(request: Request): boolean {
+	let ifHeader = request.headers.get('If') ?? '';
+	return ifHeader.includes('<DAV:no-lock>') && !ifHeader.includes('Not <DAV:no-lock>');
+}
+
+function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
+	if (left.byteLength !== right.byteLength) {
+		return false;
+	}
+	let mismatch = 0;
+	for (let index = 0; index < left.byteLength; index++) {
+		mismatch |= left[index] ^ right[index];
+	}
+	return mismatch === 0;
+}
+
 function extractLockOwner(body: string): string | undefined {
 	let owner = body.match(/<owner(?:\s[^>]*)?>([\s\S]*?)<\/owner>/i)?.[1];
 	if (owner === undefined) {
@@ -361,6 +552,26 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	};
 }
 
+function getLivePropertyValue(object: R2Object | null, property: DeadProperty): string | undefined {
+	if (property.namespaceURI !== DAV_NAMESPACE) {
+		return undefined;
+	}
+	return fromR2Object(object)[property.localName as keyof DavProperties];
+}
+
+function renderPropstat(status: string, properties: string[]): string {
+	if (properties.length === 0) {
+		return '';
+	}
+	return `
+		<propstat>
+			<prop>
+			${properties.join('\n				')}
+			</prop>
+			<status>${status}</status>
+		</propstat>`;
+}
+
 function make_resource_path(request: Request): string {
 	return decodeResourcePath(new URL(request.url).pathname);
 }
@@ -370,6 +581,9 @@ async function assertLockPermission(
 	bucket: R2Bucket,
 	resourcePath: string,
 ): Promise<Response | null> {
+	if (hasAlwaysFalseIfCondition(request)) {
+		return new Response('Precondition Failed', { status: 412 });
+	}
 	let lockTokens = getRequestLockTokens(request);
 	let candidates: string[] = [];
 
@@ -415,6 +629,30 @@ async function assertRecursiveDeletePermission(
 		}
 	}
 
+	return null;
+}
+
+async function findMatchingLock(
+	request: Request,
+	bucket: R2Bucket,
+	resourcePath: string,
+): Promise<{ resource: R2Object; lockDetails: LockDetails } | null> {
+	let lockTokens = getRequestLockTokens(request);
+	for (let current = resourcePath; ; current = current.split('/').slice(0, -1).join('/')) {
+		let resource = await bucket.head(current);
+		let lockDetails = getLockDetails(resource?.customMetadata);
+		if (
+			resource !== null &&
+			lockDetails !== undefined &&
+			lockTokens.includes(lockDetails.token) &&
+			(current === resourcePath || lockDetails.depth === 'infinity')
+		) {
+			return { resource, lockDetails };
+		}
+		if (current === '') {
+			break;
+		}
+	}
 	return null;
 }
 
@@ -621,11 +859,9 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 }
 
 async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Response> {
-	// Stupid Windows Explorer carries the body, we have to support it.
-	// So dont check for request.body.
-	// if (request.body) {
-	// 	return new Response('Unsupported Media Type', { status: 415 });
-	// }
+	if ((await request.clone().arrayBuffer()).byteLength > 0) {
+		return new Response('Unsupported Media Type', { status: 415 });
+	}
 
 	let resource_path = make_resource_path(request);
 	let lockResponse = await assertLockPermission(request, bucket, resource_path);
@@ -652,46 +888,68 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	return new Response('', { status: 201 });
 }
 
-function generate_propfind_response(object: R2Object | null): string {
-	if (object === null) {
-		return `
-	<response>
-		<href>/</href>
-		<propstat>
-			<prop>
-			${Object.entries(fromR2Object(null))
-				.flatMap(([key, value]) => (value === undefined ? [] : [renderDavProperty(key, value)]))
-				.join('\n				')}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
-	</response>`;
+function generate_propfind_response(object: R2Object | null, propfindRequest: PropfindRequest): string {
+	let href =
+		object === null ? '/' : getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
+	let deadProperties = getDeadProperties(object?.customMetadata);
+	let liveProperties = Object.entries(fromR2Object(object)).flatMap(([key, value]) =>
+		value === undefined ? [] : [renderDavProperty(key, value)],
+	);
+
+	let okProperties: string[] = [];
+	let missingProperties: string[] = [];
+
+	switch (propfindRequest.mode) {
+		case 'allprop': {
+			okProperties = [...liveProperties, ...deadProperties.map(renderPropertyElement)];
+			break;
+		}
+		case 'propname': {
+			okProperties = [
+				...Object.entries(fromR2Object(object)).flatMap(([key, value]) =>
+					value === undefined ? [] : [renderDavProperty(key, '')],
+				),
+				...deadProperties.map((property) => renderEmptyPropertyElement({ ...property, valueXml: '' })),
+			];
+			break;
+		}
+		case 'prop': {
+			for (const property of propfindRequest.properties) {
+				let liveValue = getLivePropertyValue(object, property);
+				if (liveValue !== undefined) {
+					okProperties.push(renderDavProperty(property.localName, liveValue));
+					continue;
+				}
+				let deadProperty = getDeadProperty(object?.customMetadata, property.namespaceURI, property.localName);
+				if (deadProperty !== null) {
+					okProperties.push(renderPropertyElement(deadProperty));
+				} else {
+					missingProperties.push(renderEmptyPropertyElement({ ...property, valueXml: '' }));
+				}
+			}
+			break;
+		}
 	}
 
-	let href = getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />');
 	return `
 	<response>
-		<href>${escapeXml(href)}</href>
-		<propstat>
-			<prop>
-			${Object.entries(fromR2Object(object))
-				.flatMap(([key, value]) => (value === undefined ? [] : [renderDavProperty(key, value)]))
-				.join('\n				')}
-			</prop>
-			<status>HTTP/1.1 200 OK</status>
-		</propstat>
+		<href>${escapeXml(href)}</href>${renderPropstat('HTTP/1.1 200 OK', okProperties)}${renderPropstat('HTTP/1.1 404 Not Found', missingProperties)}
 	</response>`;
 }
 
 async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
+	let propfindRequest = parsePropfindRequest(await request.text());
+	if (propfindRequest === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
 
 	let is_collection: boolean;
 	let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
 	if (resource_path === '') {
-		page += generate_propfind_response(null);
+		page += generate_propfind_response(null, propfindRequest);
 		is_collection = true;
 	} else {
 		let object = await bucket.head(resource_path);
@@ -699,7 +957,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 			return new Response('Not Found', { status: 404 });
 		}
 		is_collection = object.customMetadata?.resourcetype === '<collection />';
-		page += generate_propfind_response(object);
+		page += generate_propfind_response(object, propfindRequest);
 	}
 
 	if (is_collection) {
@@ -711,7 +969,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				{
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
 					for await (let object of listAll(bucket, prefix)) {
-						page += generate_propfind_response(object);
+						page += generate_propfind_response(object, propfindRequest);
 					}
 				}
 				break;
@@ -719,7 +977,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				{
 					let prefix = resource_path === '' ? resource_path : resource_path + '/';
 					for await (let object of listAll(bucket, prefix, true)) {
-						page += generate_propfind_response(object);
+						page += generate_propfind_response(object, propfindRequest);
 					}
 				}
 				break;
@@ -751,76 +1009,38 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 		return new Response('Not Found', { status: 404 });
 	}
 
-	// 读取请求体
 	const body = await request.text();
-
-	// 使用 HTMLRewriter 解析 XML
-	const setProperties: { [key: string]: string } = {};
-	const removeProperties: string[] = [];
-	let currentAction: 'set' | 'remove' | null = null;
-	let currentPropName: string | null = null;
-	let currentPropValue: string = '';
-
-	class PropHandler {
-		element(element: Element) {
-			const tagName = element.tagName.toLowerCase();
-			if (tagName === 'set') {
-				currentAction = 'set';
-			} else if (tagName === 'remove') {
-				currentAction = 'remove';
-			} else if (tagName === 'prop') {
-				// 忽略 <prop> 标签
-			} else {
-				// 属性名称
-				currentPropName = tagName;
-				currentPropValue = '';
-			}
-		}
-
-		text(textChunk: Text) {
-			if (currentPropName) {
-				currentPropValue += textChunk.text;
-			}
-		}
-
-		end(element: Element) {
-			if (currentAction === 'set' && currentPropName) {
-				setProperties[currentPropName] = currentPropValue.trim();
-			} else if (currentAction === 'remove' && currentPropName) {
-				removeProperties.push(currentPropName);
-			}
-			currentPropName = null;
-			currentPropValue = '';
-		}
+	let parsedRequest = parseProppatchRequest(body);
+	if (parsedRequest === null) {
+		return new Response('Bad Request', { status: 400 });
 	}
-
-	// 使用 HTMLRewriter 解析请求体
-	await new HTMLRewriter().on('propertyupdate', new PropHandler()).transform(new Response(body)).arrayBuffer();
+	const { operations } = parsedRequest;
 
 	// 复制原有的自定义元数据
 	const customMetadata = getPreservedCustomMetadata(object.customMetadata);
-	const successfulSetProperties: string[] = [];
-	const failedSetProperties: string[] = [];
-	const successfulRemoveProperties: string[] = [];
-	const failedRemoveProperties: string[] = [];
+	const successfulSetProperties: DeadProperty[] = [];
+	const failedSetProperties: DeadProperty[] = [];
+	const successfulRemoveProperties: DeadProperty[] = [];
+	const failedRemoveProperties: DeadProperty[] = [];
 
 	// 更新元数据
-	for (const propName in setProperties) {
-		if (isProtectedProperty(propName)) {
-			failedSetProperties.push(propName);
+	for (const operation of operations) {
+		if (isProtectedProperty(operation.property)) {
+			if (operation.action === 'set') {
+				failedSetProperties.push(operation.property);
+			} else {
+				failedRemoveProperties.push(operation.property);
+			}
 			continue;
 		}
-		customMetadata[propName] = setProperties[propName];
-		successfulSetProperties.push(propName);
-	}
-
-	for (const propName of removeProperties) {
-		if (isProtectedProperty(propName)) {
-			failedRemoveProperties.push(propName);
-			continue;
+		if (operation.action === 'set') {
+			customMetadata[getDeadPropertyKey(operation.property.namespaceURI, operation.property.localName)] =
+				JSON.stringify(operation.property);
+			successfulSetProperties.push(operation.property);
+		} else {
+			delete customMetadata[getDeadPropertyKey(operation.property.namespaceURI, operation.property.localName)];
+			successfulRemoveProperties.push(operation.property);
 		}
-		delete customMetadata[propName];
-		successfulRemoveProperties.push(propName);
 	}
 
 	const hasFailures = failedSetProperties.length > 0 || failedRemoveProperties.length > 0;
@@ -839,35 +1059,32 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 
 	// 构造响应
 	let propstats = new Map<string, string[]>();
-	const appendPropstat = (propName: string, status: string) => {
-		if (!isValidXmlTagName(propName)) {
-			return;
-		}
+	const appendPropstat = (property: DeadProperty, status: string) => {
 		let props = propstats.get(status) ?? [];
-		props.push(propName);
+		props.push(renderEmptyPropertyElement({ ...property, valueXml: '' }));
 		propstats.set(status, props);
 	};
 	const successStatus = hasFailures ? 'HTTP/1.1 424 Failed Dependency' : 'HTTP/1.1 200 OK';
 
-	for (const propName of successfulSetProperties) {
-		appendPropstat(propName, successStatus);
+	for (const property of successfulSetProperties) {
+		appendPropstat(property, successStatus);
 	}
 
-	for (const propName of successfulRemoveProperties) {
-		appendPropstat(propName, successStatus);
+	for (const property of successfulRemoveProperties) {
+		appendPropstat(property, successStatus);
 	}
 
-	for (const propName of failedSetProperties) {
-		appendPropstat(propName, 'HTTP/1.1 403 Forbidden');
+	for (const property of failedSetProperties) {
+		appendPropstat(property, 'HTTP/1.1 403 Forbidden');
 	}
 
-	for (const propName of failedRemoveProperties) {
-		appendPropstat(propName, 'HTTP/1.1 403 Forbidden');
+	for (const property of failedRemoveProperties) {
+		appendPropstat(property, 'HTTP/1.1 403 Forbidden');
 	}
 
 	let responseXML = `<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">\n\t<response>\n\t\t<href>${escapeXml(getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />'))}</href>`;
 	for (const [status, propNames] of propstats) {
-		responseXML += `\n\t\t<propstat>\n\t\t\t<prop>\n${propNames.map((propName) => `\t\t\t\t<${propName} />`).join('\n')}\n\t\t\t</prop>\n\t\t\t<status>${status}</status>\n\t\t</propstat>`;
+		responseXML += `\n\t\t<propstat>\n\t\t\t<prop>\n${propNames.map((propName) => `\t\t\t\t${propName}`).join('\n')}\n\t\t\t</prop>\n\t\t\t<status>${status}</status>\n\t\t</propstat>`;
 	}
 	responseXML += '\n\t</response>\n</multistatus>';
 
@@ -1116,13 +1333,17 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 		return lockResponse;
 	}
 
-	let resource = await bucket.head(resource_path);
-	let existingLock = getLockDetails(resource?.customMetadata);
-	if (existingLock !== undefined) {
+	let refreshTarget = body === '' ? await findMatchingLock(request, bucket, resource_path) : null;
+	let resource = refreshTarget?.resource ?? (await bucket.head(resource_path));
+	let existingLock = refreshTarget?.lockDetails ?? getLockDetails(resource?.customMetadata);
+	if (refreshTarget === null && existingLock !== undefined) {
 		if (!getRequestLockTokens(request).includes(existingLock.token)) {
 			return new Response('Locked', { status: 423 });
 		}
 	} else if (resource === null) {
+		if (body === '') {
+			return new Response('Bad Request', { status: 400 });
+		}
 		if (!(await hasCollectionResource(bucket, getParentPath(resource_path)))) {
 			return new Response('Conflict', { status: 409 });
 		}
@@ -1299,7 +1520,7 @@ function is_authorized(authorization_header: string, username: string, password:
 	const header = encoder.encode(authorization_header);
 	const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
 
-	return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
+	return timingSafeEqual(header, expected);
 }
 
 export default {
