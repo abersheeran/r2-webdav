@@ -96,7 +96,10 @@ function determineLockDepth(
 }
 
 function normalizeLockToken(lockToken: string): string {
-	return lockToken.trim().replace(/^<|>$/g, '').replace(/^(?:urn:uuid:|opaquelocktoken:)/, '');
+	return lockToken
+		.trim()
+		.replace(/^<|>$/g, '')
+		.replace(/^(?:urn:uuid:|opaquelocktoken:)/, '');
 }
 
 function getLockDetails(customMetadata: Record<string, string> | undefined): LockDetails | undefined {
@@ -139,7 +142,10 @@ function stripLockMetadata(customMetadata: Record<string, string> | undefined): 
 	return metadata;
 }
 
-function withLockMetadata(customMetadata: Record<string, string> | undefined, lockDetails: LockDetails): Record<string, string> {
+function withLockMetadata(
+	customMetadata: Record<string, string> | undefined,
+	lockDetails: LockDetails,
+): Record<string, string> {
 	return {
 		...stripLockMetadata(customMetadata),
 		lock_token: lockDetails.token,
@@ -161,7 +167,13 @@ function getPreservedCustomMetadata(customMetadata: Record<string, string> | und
 
 function isProtectedProperty(propName: string): boolean {
 	let localPropName = propName.split(':').pop() ?? propName;
-	return LOCK_METADATA_KEYS.includes(localPropName) || localPropName === 'supportedlock' || localPropName === 'lockdiscovery';
+	return (
+		LOCK_METADATA_KEYS.includes(localPropName) || localPropName === 'supportedlock' || localPropName === 'lockdiscovery'
+	);
+}
+
+function isValidXmlTagName(propName: string): boolean {
+	return /^[A-Za-z_][A-Za-z0-9._:-]*$/.test(propName);
 }
 
 function parseTimeout(timeoutHeader: string | null): { timeout: string; expiresAt: number } {
@@ -260,7 +272,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 				: getLockDiscovery({
 						...lockDetails,
 						root: getResourceHref(object.key, isCollection),
-				  }),
+					}),
 	};
 }
 
@@ -270,7 +282,11 @@ function make_resource_path(request: Request): string {
 	return path;
 }
 
-async function assertLockPermission(request: Request, bucket: R2Bucket, resourcePath: string): Promise<Response | null> {
+async function assertLockPermission(
+	request: Request,
+	bucket: R2Bucket,
+	resourcePath: string,
+): Promise<Response | null> {
 	let lockTokens = getRequestLockTokens(request);
 	let candidates: string[] = [];
 
@@ -356,28 +372,28 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 					...{ 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` },
 					...(object.httpMetadata?.contentDisposition
 						? {
-							'Content-Disposition': object.httpMetadata.contentDisposition,
-						}
+								'Content-Disposition': object.httpMetadata.contentDisposition,
+							}
 						: {}),
 					...(object.httpMetadata?.contentEncoding
 						? {
-							'Content-Encoding': object.httpMetadata.contentEncoding,
-						}
+								'Content-Encoding': object.httpMetadata.contentEncoding,
+							}
 						: {}),
 					...(object.httpMetadata?.contentLanguage
 						? {
-							'Content-Language': object.httpMetadata.contentLanguage,
-						}
+								'Content-Language': object.httpMetadata.contentLanguage,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheControl
 						? {
-							'Cache-Control': object.httpMetadata.cacheControl,
-						}
+								'Cache-Control': object.httpMetadata.cacheControl,
+							}
 						: {}),
 					...(object.httpMetadata?.cacheExpiry
 						? {
-							'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
-						}
+								'Cache-Expiry': object.httpMetadata.cacheExpiry.toISOString(),
+							}
 						: {}),
 				},
 			});
@@ -544,9 +560,9 @@ function generate_propfind_response(object: R2Object | null): string {
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
-			.filter(([_, value]) => value !== undefined)
-			.map(([key, value]) => `<${key}>${value}</${key}>`)
-			.join('\n				')}
+				.filter(([_, value]) => value !== undefined)
+				.map(([key, value]) => `<${key}>${value}</${key}>`)
+				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
@@ -669,20 +685,28 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 
 	// 复制原有的自定义元数据
 	const customMetadata = getPreservedCustomMetadata(object.customMetadata);
+	const successfulSetProperties: string[] = [];
+	const failedSetProperties: string[] = [];
+	const successfulRemoveProperties: string[] = [];
+	const failedRemoveProperties: string[] = [];
 
 	// 更新元数据
 	for (const propName in setProperties) {
 		if (isProtectedProperty(propName)) {
+			failedSetProperties.push(propName);
 			continue;
 		}
 		customMetadata[propName] = setProperties[propName];
+		successfulSetProperties.push(propName);
 	}
 
 	for (const propName of removeProperties) {
 		if (isProtectedProperty(propName)) {
+			failedRemoveProperties.push(propName);
 			continue;
 		}
 		delete customMetadata[propName];
+		successfulRemoveProperties.push(propName);
 	}
 
 	// 更新对象的元数据
@@ -698,8 +722,10 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 
 	// 构造响应
 	let responseXML = '<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">\n';
-
-	for (const propName in setProperties) {
+	const appendPropstat = (propName: string, status: string) => {
+		if (!isValidXmlTagName(propName)) {
+			return;
+		}
 		responseXML += `
     <response>
         <href>/${object.key}</href>
@@ -707,22 +733,25 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
             <prop>
                 <${propName} />
             </prop>
-            <status>HTTP/1.1 200 OK</status>
+            <status>${status}</status>
         </propstat>
     </response>\n`;
+	};
+
+	for (const propName of successfulSetProperties) {
+		appendPropstat(propName, 'HTTP/1.1 200 OK');
 	}
 
-	for (const propName of removeProperties) {
-		responseXML += `
-    <response>
-        <href>/${object.key}</href>
-        <propstat>
-            <prop>
-                <${propName} />
-            </prop>
-            <status>HTTP/1.1 200 OK</status>
-        </propstat>
-    </response>\n`;
+	for (const propName of successfulRemoveProperties) {
+		appendPropstat(propName, 'HTTP/1.1 200 OK');
+	}
+
+	for (const propName of failedSetProperties) {
+		appendPropstat(propName, 'HTTP/1.1 403 Forbidden');
+	}
+
+	for (const propName of failedRemoveProperties) {
+		appendPropstat(propName, 'HTTP/1.1 403 Forbidden');
 	}
 
 	responseXML += '</multistatus>';
@@ -1058,7 +1087,20 @@ async function handle_unlock(request: Request, bucket: R2Bucket): Promise<Respon
 }
 
 const DAV_CLASS = '1, 3';
-const SUPPORT_METHODS = ['OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'GET', 'HEAD', 'PUT', 'DELETE', 'COPY', 'MOVE', 'LOCK', 'UNLOCK'];
+const SUPPORT_METHODS = [
+	'OPTIONS',
+	'PROPFIND',
+	'PROPPATCH',
+	'MKCOL',
+	'GET',
+	'HEAD',
+	'PUT',
+	'DELETE',
+	'COPY',
+	'MOVE',
+	'LOCK',
+	'UNLOCK',
+];
 
 async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Response> {
 	switch (request.method) {
@@ -1117,12 +1159,12 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 }
 
 function is_authorized(authorization_header: string, username: string, password: string): boolean {
-    const encoder = new TextEncoder();
+	const encoder = new TextEncoder();
 
-    const header = encoder.encode(authorization_header);
-    const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
+	const header = encoder.encode(authorization_header);
+	const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
 
-    return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
+	return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
 }
 
 export default {
@@ -1148,13 +1190,31 @@ export default {
 		response.headers.set('Access-Control-Allow-Methods', SUPPORT_METHODS.join(', '));
 		response.headers.set(
 			'Access-Control-Allow-Headers',
-			['authorization', 'content-type', 'depth', 'overwrite', 'destination', 'range', 'if', 'lock-token', 'timeout'].join(', '),
+			[
+				'authorization',
+				'content-type',
+				'depth',
+				'overwrite',
+				'destination',
+				'range',
+				'if',
+				'lock-token',
+				'timeout',
+			].join(', '),
 		);
 		response.headers.set(
 			'Access-Control-Expose-Headers',
-			['content-type', 'content-length', 'dav', 'etag', 'last-modified', 'location', 'date', 'content-range', 'lock-token'].join(
-				', ',
-			),
+			[
+				'content-type',
+				'content-length',
+				'dav',
+				'etag',
+				'last-modified',
+				'location',
+				'date',
+				'content-range',
+				'lock-token',
+			].join(', '),
 		);
 		response.headers.set('Access-Control-Allow-Credentials', 'false');
 		response.headers.set('Access-Control-Max-Age', '86400');
