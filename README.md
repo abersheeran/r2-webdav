@@ -4,7 +4,7 @@
 
 Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
-Currently the server advertises WebDAV Class 1 and Class 3 support, including LOCK and UNLOCK.
+Currently the server advertises WebDAV Class 1 and Class 2 support, including LOCK and UNLOCK.
 
 ## Usage
 
@@ -27,7 +27,7 @@ wrangler secret put PASSWORD
 
 ## Development
 
-With `wrangler`, you can build, test, and deploy your Worker with the following commands:
+With `wrangler`, you can run and deploy your Worker with the following commands:
 
 ```sh
 # run your Worker in an ideal development workflow (with a local server, file watcher & more)

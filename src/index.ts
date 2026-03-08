@@ -125,12 +125,40 @@ async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Pr
 	return resource?.customMetadata?.resourcetype === '<collection />';
 }
 
-function parseDestinationPath(destinationHeader: string): string | null {
+function parseDestinationPath(destinationHeader: string, requestUrl: string): string | null {
 	try {
-		return decodeResourcePath(new URL(destinationHeader).pathname);
+		let destinationUrl = new URL(destinationHeader, requestUrl);
+		if (destinationUrl.origin !== new URL(requestUrl).origin) {
+			return null;
+		}
+		return decodeResourcePath(destinationUrl.pathname);
 	} catch {
 		return null;
 	}
+}
+
+function isSameOrDescendantPath(resourcePath: string, destinationPath: string): boolean {
+	if (destinationPath === resourcePath) {
+		return true;
+	}
+	if (resourcePath === '') {
+		return destinationPath !== '';
+	}
+	return destinationPath.startsWith(`${resourcePath}/`);
+}
+
+function createdResponse(
+	resourcePath: string,
+	isCollection: boolean,
+	body: BodyInit | null = '',
+	headers: HeadersInit = {},
+): Response {
+	let responseHeaders = new Headers(headers);
+	responseHeaders.set('Location', getResourceHref(resourcePath, isCollection));
+	return new Response(body, {
+		status: 201,
+		headers: responseHeaders,
+	});
 }
 
 function renderDavProperty(propName: string, value: string): string {
@@ -403,6 +431,13 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 	let resource_path = make_resource_path(request);
 
 	if (request.url.endsWith('/')) {
+		if (resource_path !== '') {
+			let resource = await bucket.head(resource_path);
+			if (resource === null || resource.customMetadata?.resourcetype !== '<collection />') {
+				return new Response('Not Found', { status: 404 });
+			}
+		}
+
 		let page = '',
 			prefix = resource_path;
 		if (resource_path !== '') {
@@ -486,7 +521,7 @@ function calcContentRange(object: R2ObjectBody) {
 	let rangeOffset = 0;
 	let rangeEnd = object.size - 1;
 	if (object.range) {
-		if (object.range.suffix != null) {
+		if ('suffix' in object.range) {
 			// Case 3: {suffix: number}
 			rangeOffset = object.size - object.range.suffix;
 		} else {
@@ -625,8 +660,7 @@ function generate_propfind_response(object: R2Object | null): string {
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(null))
-				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => renderDavProperty(key, value))
+				.flatMap(([key, value]) => (value === undefined ? [] : [renderDavProperty(key, value)]))
 				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
@@ -641,8 +675,7 @@ function generate_propfind_response(object: R2Object | null): string {
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
-				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => renderDavProperty(key, value))
+				.flatMap(([key, value]) => (value === undefined ? [] : [renderDavProperty(key, value)]))
 				.join('\n				')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
@@ -700,7 +733,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	return new Response(page, {
 		status: 207,
 		headers: {
-			'Content-Type': 'text/xml',
+			'Content-Type': 'application/xml; charset=utf-8',
 		},
 	});
 }
@@ -805,21 +838,14 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	}
 
 	// 构造响应
-	let responseXML = '<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">\n';
+	let propstats = new Map<string, string[]>();
 	const appendPropstat = (propName: string, status: string) => {
 		if (!isValidXmlTagName(propName)) {
 			return;
 		}
-		responseXML += `
-    <response>
-        <href>${escapeXml(getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />'))}</href>
-        <propstat>
-            <prop>
-                <${propName} />
-            </prop>
-            <status>${status}</status>
-        </propstat>
-    </response>\n`;
+		let props = propstats.get(status) ?? [];
+		props.push(propName);
+		propstats.set(status, props);
 	};
 	const successStatus = hasFailures ? 'HTTP/1.1 424 Failed Dependency' : 'HTTP/1.1 200 OK';
 
@@ -839,12 +865,16 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 		appendPropstat(propName, 'HTTP/1.1 403 Forbidden');
 	}
 
-	responseXML += '</multistatus>';
+	let responseXML = `<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">\n\t<response>\n\t\t<href>${escapeXml(getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />'))}</href>`;
+	for (const [status, propNames] of propstats) {
+		responseXML += `\n\t\t<propstat>\n\t\t\t<prop>\n${propNames.map((propName) => `\t\t\t\t<${propName} />`).join('\n')}\n\t\t\t</prop>\n\t\t\t<status>${status}</status>\n\t\t</propstat>`;
+	}
+	responseXML += '\n\t</response>\n</multistatus>';
 
 	return new Response(responseXML, {
 		status: 207,
 		headers: {
-			'Content-Type': 'application/xml; charset="utf-8"',
+			'Content-Type': 'application/xml; charset=utf-8',
 		},
 	});
 }
@@ -856,8 +886,11 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let destination = parseDestinationPath(destination_header);
+	let destination = parseDestinationPath(destination_header, request.url);
 	if (destination === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
+	if (isSameOrDescendantPath(resource_path, destination)) {
 		return new Response('Bad Request', { status: 400 });
 	}
 	let lockResponse = await assertLockPermission(request, bucket, destination);
@@ -908,7 +941,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 				if (destination_exists) {
 					return new Response(null, { status: 204 });
 				} else {
-					return new Response('', { status: 201 });
+					return createdResponse(destination, true);
 				}
 			}
 			case '0': {
@@ -923,7 +956,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 				if (destination_exists) {
 					return new Response(null, { status: 204 });
 				} else {
-					return new Response('', { status: 201 });
+					return createdResponse(destination, true);
 				}
 			}
 			default: {
@@ -942,20 +975,23 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 		if (destination_exists) {
 			return new Response(null, { status: 204 });
 		} else {
-			return new Response('', { status: 201 });
+			return createdResponse(destination, false);
 		}
 	}
 }
 
 async function handle_move(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
-	let overwrite = request.headers.get('Overwrite') === 'T';
+	let overwrite = request.headers.get('Overwrite') !== 'F';
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let destination = parseDestinationPath(destination_header);
+	let destination = parseDestinationPath(destination_header, request.url);
 	if (destination === null) {
+		return new Response('Bad Request', { status: 400 });
+	}
+	if (isSameOrDescendantPath(resource_path, destination)) {
 		return new Response('Bad Request', { status: 400 });
 	}
 	let sourceLockResponse = await assertLockPermission(request, bucket, resource_path);
@@ -1035,23 +1071,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 				if (destination_exists) {
 					return new Response(null, { status: 204 });
 				} else {
-					return new Response('', { status: 201 });
-				}
-			}
-			case '0': {
-				let object = await bucket.get(resource.key);
-				if (object === null) {
-					return new Response('Not Found', { status: 404 });
-				}
-				await bucket.put(destination, object.body, {
-					httpMetadata: object.httpMetadata,
-					customMetadata: getPreservedCustomMetadata(object.customMetadata),
-				});
-				await bucket.delete(resource.key);
-				if (destination_exists) {
-					return new Response(null, { status: 204 });
-				} else {
-					return new Response('', { status: 201 });
+					return createdResponse(destination, true);
 				}
 			}
 			default: {
@@ -1071,7 +1091,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		if (destination_exists) {
 			return new Response(null, { status: 204 });
 		} else {
-			return new Response('', { status: 201 });
+			return createdResponse(destination, false);
 		}
 	}
 }
@@ -1155,8 +1175,13 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 		{
 			status: existingLock ? 200 : 201,
 			headers: {
-				'Content-Type': 'application/xml; charset="utf-8"',
+				'Content-Type': 'application/xml; charset=utf-8',
 				'Lock-Token': `<urn:uuid:${lockDetails.token}>`,
+				...(existingLock
+					? {}
+					: {
+							Location: getResourceHref(resource.key, resource.customMetadata?.resourcetype === '<collection />'),
+						}),
 			},
 		},
 	);
@@ -1196,7 +1221,7 @@ async function handle_unlock(request: Request, bucket: R2Bucket): Promise<Respon
 	return new Response(null, { status: 204 });
 }
 
-const DAV_CLASS = '1, 3';
+const DAV_CLASS = '1, 2';
 const SUPPORT_METHODS = [
 	'OPTIONS',
 	'PROPFIND',
