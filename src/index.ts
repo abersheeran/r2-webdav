@@ -984,10 +984,17 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
 	}
-	let depth = determineLockDepth(
-		resource.customMetadata?.resourcetype,
-		depthHeader as (typeof VALID_LOCK_DEPTHS)[number] | null,
-	);
+	let depth: (typeof VALID_LOCK_DEPTHS)[number];
+	if (existingLock !== undefined && depthHeader === null && body === '') {
+		// Refreshing an existing lock without an explicit Depth header:
+		// preserve the original lock depth instead of broadening it.
+		depth = existingLock.depth;
+	} else {
+		depth = determineLockDepth(
+			resource.customMetadata?.resourcetype,
+			depthHeader as (typeof VALID_LOCK_DEPTHS)[number] | null,
+		);
+	}
 
 	let lockDetails: LockDetails = {
 		token: existingLock?.token ?? crypto.randomUUID(),
