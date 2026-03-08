@@ -64,6 +64,7 @@ const DEFAULT_LOCK_TIMEOUT = 3600;
 const MAX_LOCK_TIMEOUT = 365 * 24 * 60 * 60;
 const VALID_LOCK_DEPTHS = ['0', 'infinity'] as const;
 const LOCK_METADATA_KEYS = ['lock_token', 'lock_owner', 'lock_depth', 'lock_timeout', 'lock_expires_at', 'lock_root'];
+const INTERNAL_DELETE_FORWARD_HEADERS = ['If', 'Lock-Token'] as const;
 
 function escapeXml(value: string): string {
 	return value
@@ -313,6 +314,28 @@ async function assertLockPermission(
 	return null;
 }
 
+async function assertRecursiveDeletePermission(
+	request: Request,
+	bucket: R2Bucket,
+	resourcePath: string,
+): Promise<Response | null> {
+	let lockResponse = await assertLockPermission(request, bucket, resourcePath);
+	if (lockResponse !== null) {
+		return lockResponse;
+	}
+
+	let lockTokens = getRequestLockTokens(request);
+	let prefix = resourcePath === '' ? '' : resourcePath + '/';
+	for await (let descendant of listAll(bucket, prefix, true)) {
+		let lockDetails = getLockDetails(descendant.customMetadata);
+		if (lockDetails !== undefined && !lockTokens.includes(lockDetails.token)) {
+			return new Response('Locked', { status: 423 });
+		}
+	}
+
+	return null;
+}
+
 async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
 	let response = await handle_get(request, bucket);
 	return new Response(null, {
@@ -451,7 +474,7 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 
 async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
-	let lockResponse = await assertLockPermission(request, bucket, resource_path);
+	let lockResponse = await assertRecursiveDeletePermission(request, bucket, resource_path);
 	if (lockResponse !== null) {
 		return lockResponse;
 	}
@@ -478,8 +501,8 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
 	}
-	await bucket.delete(resource_path);
 	if (resource.customMetadata?.resourcetype !== '<collection />') {
+		await bucket.delete(resource_path);
 		return new Response(null, { status: 204 });
 	}
 
@@ -500,6 +523,7 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 		}
 	} while (r2_objects.truncated);
 
+	await bucket.delete(resource_path);
 	return new Response(null, { status: 204 });
 }
 
@@ -709,16 +733,19 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 		successfulRemoveProperties.push(propName);
 	}
 
-	// 更新对象的元数据
-	const src = await bucket.get(object.key);
-	if (src === null) {
-		return new Response('Not Found', { status: 404 });
-	}
+	const hasFailures = failedSetProperties.length > 0 || failedRemoveProperties.length > 0;
+	if (!hasFailures) {
+		// 更新对象的元数据
+		const src = await bucket.get(object.key);
+		if (src === null) {
+			return new Response('Not Found', { status: 404 });
+		}
 
-	await bucket.put(object.key, src.body, {
-		httpMetadata: object.httpMetadata,
-		customMetadata: customMetadata,
-	});
+		await bucket.put(object.key, src.body, {
+			httpMetadata: object.httpMetadata,
+			customMetadata: customMetadata,
+		});
+	}
 
 	// 构造响应
 	let responseXML = '<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">\n';
@@ -737,13 +764,14 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
         </propstat>
     </response>\n`;
 	};
+	const successStatus = hasFailures ? 'HTTP/1.1 424 Failed Dependency' : 'HTTP/1.1 200 OK';
 
 	for (const propName of successfulSetProperties) {
-		appendPropstat(propName, 'HTTP/1.1 200 OK');
+		appendPropstat(propName, successStatus);
 	}
 
 	for (const propName of successfulRemoveProperties) {
-		appendPropstat(propName, 'HTTP/1.1 200 OK');
+		appendPropstat(propName, successStatus);
 	}
 
 	for (const propName of failedSetProperties) {
@@ -906,7 +934,23 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 
 	if (destination_exists) {
 		// Delete the destination first
-		await handle_delete(new Request(new URL(destination_header), request), bucket);
+		let deleteHeaders = new Headers();
+		for (const headerName of INTERNAL_DELETE_FORWARD_HEADERS) {
+			let headerValue = request.headers.get(headerName);
+			if (headerValue !== null) {
+				deleteHeaders.set(headerName, headerValue);
+			}
+		}
+		let deleteResponse = await handle_delete(
+			new Request(new URL(destination_header), {
+				method: 'DELETE',
+				headers: deleteHeaders,
+			}),
+			bucket,
+		);
+		if (!deleteResponse.ok) {
+			return deleteResponse;
+		}
 	}
 
 	let is_dir = resource?.customMetadata?.resourcetype === '<collection />';
