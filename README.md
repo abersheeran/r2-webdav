@@ -4,7 +4,7 @@
 
 Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
-Currently the server advertises WebDAV Class 1 and Class 2 support, including LOCK and UNLOCK.
+Currently the server advertises WebDAV Class 1 and Class 2 (LOCK/UNLOCK) support.
 
 ## Usage
 

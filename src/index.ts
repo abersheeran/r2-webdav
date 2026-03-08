@@ -1199,7 +1199,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 
 async function handle_move(request: Request, bucket: R2Bucket): Promise<Response> {
 	let resource_path = make_resource_path(request);
-	let overwrite = request.headers.get('Overwrite') !== 'F';
+	let overwrite = (request.headers.get('Overwrite') ?? 'T') !== 'F';
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
