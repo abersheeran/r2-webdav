@@ -56,6 +56,7 @@ type DavProperties = {
 type LockDetails = {
 	token: string;
 	owner: string | undefined;
+	scope: 'exclusive' | 'shared';
 	depth: '0' | 'infinity';
 	timeout: string;
 	expiresAt: number;
@@ -89,11 +90,21 @@ type ProppatchOperation = {
 const DEFAULT_LOCK_TIMEOUT = 3600;
 const MAX_LOCK_TIMEOUT = 365 * 24 * 60 * 60;
 const VALID_LOCK_DEPTHS = ['0', 'infinity'] as const;
-const LOCK_METADATA_KEYS = ['lock_token', 'lock_owner', 'lock_depth', 'lock_timeout', 'lock_expires_at', 'lock_root'];
+const LOCK_METADATA_KEYS = [
+	'lock_token',
+	'lock_owner',
+	'lock_scope',
+	'lock_depth',
+	'lock_timeout',
+	'lock_expires_at',
+	'lock_root',
+	'lock_records',
+];
 const INTERNAL_DELETE_FORWARD_HEADERS = ['If', 'Lock-Token'] as const;
 const RAW_XML_DAV_PROPERTIES = new Set(['resourcetype', 'supportedlock', 'lockdiscovery']);
 const DAV_NAMESPACE = 'DAV:';
 const DEAD_PROPERTY_PREFIX = 'dead_property:';
+const LOCK_RECORDS_METADATA_KEY = 'lock_records';
 
 function escapeXml(value: string): string {
 	return value
@@ -342,7 +353,10 @@ function parseProppatchRequest(body: string): { operations: ProppatchOperation[]
 }
 
 function getSupportedLock(): string {
-	return '<lockentry><lockscope><exclusive /></lockscope><locktype><write /></locktype></lockentry>';
+	return [
+		'<lockentry><lockscope><exclusive /></lockscope><locktype><write /></locktype></lockentry>',
+		'<lockentry><lockscope><shared /></lockscope><locktype><write /></locktype></lockentry>',
+	].join('');
 }
 
 function determineLockDepth(
@@ -362,36 +376,68 @@ function normalizeLockToken(lockToken: string): string {
 		.replace(/^(?:urn:uuid:|opaquelocktoken:)/, '');
 }
 
-function getLockDetails(customMetadata: Record<string, string> | undefined): LockDetails | undefined {
-	let token = customMetadata?.lock_token;
-	if (token === undefined) {
-		return undefined;
-	}
-
-	let expiresAt = Number(customMetadata?.lock_expires_at ?? 0);
+function normalizeLockDetails(lockDetails: Partial<LockDetails> & Pick<LockDetails, 'token'>): LockDetails | null {
+	let expiresAt = Number(lockDetails.expiresAt ?? 0);
 	if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
 		expiresAt = Date.now() + DEFAULT_LOCK_TIMEOUT * 1000;
 	}
 	if (expiresAt <= Date.now()) {
-		return undefined;
+		return null;
 	}
 
 	return {
-		token,
-		owner: customMetadata?.lock_owner,
-		depth: customMetadata?.lock_depth === 'infinity' ? 'infinity' : '0',
-		timeout: customMetadata?.lock_timeout ?? `Second-${DEFAULT_LOCK_TIMEOUT}`,
+		token: lockDetails.token,
+		owner: lockDetails.owner,
+		scope: lockDetails.scope === 'shared' ? 'shared' : 'exclusive',
+		depth: lockDetails.depth === 'infinity' ? 'infinity' : '0',
+		timeout: lockDetails.timeout ?? `Second-${DEFAULT_LOCK_TIMEOUT}`,
 		expiresAt,
-		root: customMetadata?.lock_root ?? '/',
+		root: lockDetails.root ?? '/',
 	};
 }
 
-function getLockDiscovery(lockDetails: LockDetails | undefined): string {
-	if (lockDetails === undefined) {
-		return '';
+function getLockDetails(customMetadata: Record<string, string> | undefined): LockDetails[] {
+	let records = customMetadata?.[LOCK_RECORDS_METADATA_KEY];
+	if (records !== undefined) {
+		try {
+			let parsed = JSON.parse(records);
+			if (Array.isArray(parsed)) {
+				return parsed.flatMap((lockDetails) => {
+					if (lockDetails && typeof lockDetails === 'object' && typeof lockDetails.token === 'string') {
+						let normalized = normalizeLockDetails(lockDetails as Partial<LockDetails> & Pick<LockDetails, 'token'>);
+						return normalized === null ? [] : [normalized];
+					}
+					return [];
+				});
+			}
+		} catch {}
 	}
 
-	return `<activelock><locktype><write /></locktype><lockscope><exclusive /></lockscope><depth>${lockDetails.depth}</depth>${lockDetails.owner ? `<owner>${escapeXml(lockDetails.owner)}</owner>` : ''}<timeout>${escapeXml(lockDetails.timeout)}</timeout><locktoken><href>urn:uuid:${escapeXml(lockDetails.token)}</href></locktoken><lockroot><href>${escapeXml(lockDetails.root)}</href></lockroot></activelock>`;
+	let token = customMetadata?.lock_token;
+	if (token === undefined) {
+		return [];
+	}
+
+	let normalized = normalizeLockDetails({
+		token,
+		owner: customMetadata?.lock_owner,
+		scope: customMetadata?.lock_scope === 'shared' ? 'shared' : 'exclusive',
+		depth: customMetadata?.lock_depth === 'infinity' ? 'infinity' : '0',
+		timeout: customMetadata?.lock_timeout ?? `Second-${DEFAULT_LOCK_TIMEOUT}`,
+		expiresAt: Number(customMetadata?.lock_expires_at ?? 0),
+		root: customMetadata?.lock_root ?? '/',
+	});
+	return normalized === null ? [] : [normalized];
+}
+
+function getLockDiscovery(lockDetails: LockDetails | LockDetails[]): string {
+	let lockDetailList = Array.isArray(lockDetails) ? lockDetails : [lockDetails];
+	return lockDetailList
+		.map(
+			(lockDetail) =>
+				`<activelock><locktype><write /></locktype><lockscope><${lockDetail.scope} /></lockscope><depth>${lockDetail.depth}</depth>${lockDetail.owner ? `<owner>${escapeXml(lockDetail.owner)}</owner>` : ''}<timeout>${escapeXml(lockDetail.timeout)}</timeout><locktoken><href>urn:uuid:${escapeXml(lockDetail.token)}</href></locktoken><lockroot><href>${escapeXml(lockDetail.root)}</href></lockroot></activelock>`,
+		)
+		.join('');
 }
 
 function stripLockMetadata(customMetadata: Record<string, string> | undefined): Record<string, string> {
@@ -404,22 +450,21 @@ function stripLockMetadata(customMetadata: Record<string, string> | undefined): 
 
 function withLockMetadata(
 	customMetadata: Record<string, string> | undefined,
-	lockDetails: LockDetails,
+	lockDetails: LockDetails | LockDetails[],
 ): Record<string, string> {
+	let lockDetailList = Array.isArray(lockDetails) ? lockDetails : [lockDetails];
+	if (lockDetailList.length === 0) {
+		return stripLockMetadata(customMetadata);
+	}
 	return {
 		...stripLockMetadata(customMetadata),
-		lock_token: lockDetails.token,
-		...(lockDetails.owner ? { lock_owner: lockDetails.owner } : {}),
-		lock_depth: lockDetails.depth,
-		lock_timeout: lockDetails.timeout,
-		lock_expires_at: lockDetails.expiresAt.toString(),
-		lock_root: lockDetails.root,
+		[LOCK_RECORDS_METADATA_KEY]: JSON.stringify(lockDetailList),
 	};
 }
 
 function getPreservedCustomMetadata(customMetadata: Record<string, string> | undefined): Record<string, string> {
 	let lockDetails = getLockDetails(customMetadata);
-	if (lockDetails === undefined) {
+	if (lockDetails.length === 0) {
 		return stripLockMetadata(customMetadata);
 	}
 	return withLockMetadata(customMetadata, lockDetails);
@@ -543,12 +588,14 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 		resourcetype: object.customMetadata?.resourcetype ?? '',
 		supportedlock: getSupportedLock(),
 		lockdiscovery:
-			lockDetails === undefined
+			lockDetails.length === 0
 				? ''
-				: getLockDiscovery({
-						...lockDetails,
-						root: getResourceHref(object.key, isCollection),
-					}),
+				: getLockDiscovery(
+						lockDetails.map((lockDetail) => ({
+							...lockDetail,
+							root: getResourceHref(object.key, isCollection),
+						})),
+					),
 	};
 }
 
@@ -580,6 +627,7 @@ async function assertLockPermission(
 	request: Request,
 	bucket: R2Bucket,
 	resourcePath: string,
+	options: { ignoreSharedLocksOnTarget?: boolean } = {},
 ): Promise<Response | null> {
 	if (hasAlwaysFalseIfCondition(request)) {
 		return new Response('Precondition Failed', { status: 412 });
@@ -593,16 +641,16 @@ async function assertLockPermission(
 
 	for (const candidate of candidates) {
 		let object = await bucket.head(candidate);
-		let lockDetails = getLockDetails(object?.customMetadata);
-		if (lockDetails === undefined) {
+		let lockDetails = getLockDetails(object?.customMetadata).filter(
+			(lockDetail) =>
+				(candidate === resourcePath || lockDetail.depth === 'infinity') &&
+				!(options.ignoreSharedLocksOnTarget && candidate === resourcePath && lockDetail.scope === 'shared'),
+		);
+		if (lockDetails.length === 0) {
 			continue;
 		}
 
-		if (candidate !== resourcePath && lockDetails.depth !== 'infinity') {
-			continue;
-		}
-
-		if (!lockTokens.includes(lockDetails.token)) {
+		if (!lockDetails.some((lockDetail) => lockTokens.includes(lockDetail.token))) {
 			return new Response('Locked', { status: 423 });
 		}
 	}
@@ -624,7 +672,7 @@ async function assertRecursiveDeletePermission(
 	let prefix = resourcePath === '' ? '' : resourcePath + '/';
 	for await (let descendant of listAll(bucket, prefix, true)) {
 		let lockDetails = getLockDetails(descendant.customMetadata);
-		if (lockDetails !== undefined && !lockTokens.includes(lockDetails.token)) {
+		if (lockDetails.length > 0 && !lockDetails.some((lockDetail) => lockTokens.includes(lockDetail.token))) {
 			return new Response('Locked', { status: 423 });
 		}
 	}
@@ -640,13 +688,11 @@ async function findMatchingLock(
 	let lockTokens = getRequestLockTokens(request);
 	for (let current = resourcePath; ; current = current.split('/').slice(0, -1).join('/')) {
 		let resource = await bucket.head(current);
-		let lockDetails = getLockDetails(resource?.customMetadata);
-		if (
-			resource !== null &&
-			lockDetails !== undefined &&
-			lockTokens.includes(lockDetails.token) &&
-			(current === resourcePath || lockDetails.depth === 'infinity')
-		) {
+		let lockDetails = getLockDetails(resource?.customMetadata).find(
+			(lockDetail) =>
+				lockTokens.includes(lockDetail.token) && (current === resourcePath || lockDetail.depth === 'infinity'),
+		);
+		if (resource !== null && lockDetails !== undefined) {
 			return { resource, lockDetails };
 		}
 		if (current === '') {
@@ -1321,26 +1367,34 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	}
 	let { timeout, expiresAt } = parseTimeout(request.headers.get('Timeout'));
 	let body = await request.text();
-	if (/<shared\b/i.test(body)) {
-		return new Response('Not Implemented', { status: 501 });
-	}
+	// Per WebDAV, an empty LOCK request body indicates a lock refresh operation.
+	let requestedScope: LockDetails['scope'] = /<shared\b/i.test(body) ? 'shared' : 'exclusive';
+	let requestLockTokens = getRequestLockTokens(request);
 	if (body !== '' && !/<write\b/i.test(body)) {
 		return new Response('Bad Request', { status: 400 });
 	}
 	let owner = extractLockOwner(body);
-	let lockResponse = await assertLockPermission(request, bucket, resource_path);
+	let lockResponse = await assertLockPermission(request, bucket, resource_path, {
+		ignoreSharedLocksOnTarget: body !== '' && requestedScope === 'shared',
+	});
 	if (lockResponse !== null) {
 		return lockResponse;
 	}
 
 	let refreshTarget = body === '' ? await findMatchingLock(request, bucket, resource_path) : null;
 	let resource = refreshTarget?.resource ?? (await bucket.head(resource_path));
-	let existingLock = refreshTarget?.lockDetails ?? getLockDetails(resource?.customMetadata);
-	if (refreshTarget === null && existingLock !== undefined) {
-		if (!getRequestLockTokens(request).includes(existingLock.token)) {
-			return new Response('Locked', { status: 423 });
-		}
-	} else if (resource === null) {
+	let currentLocks = getLockDetails(resource?.customMetadata);
+	let existingLock = refreshTarget?.lockDetails;
+	if (
+		refreshTarget === null &&
+		body === '' &&
+		resource !== null &&
+		currentLocks.length > 0 &&
+		!currentLocks.some((currentLock) => requestLockTokens.includes(currentLock.token))
+	) {
+		return new Response('Locked', { status: 423 });
+	}
+	if (resource === null) {
 		if (body === '') {
 			return new Response('Bad Request', { status: 400 });
 		}
@@ -1355,10 +1409,19 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 			customMetadata: {},
 		});
 		resource = await bucket.head(resource_path);
+		currentLocks = [];
 	}
 
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
+	}
+	if (existingLock === undefined) {
+		if (requestedScope === 'exclusive' && currentLocks.length > 0) {
+			return new Response('Locked', { status: 423 });
+		}
+		if (requestedScope === 'shared' && currentLocks.some((lockDetail) => lockDetail.scope === 'exclusive')) {
+			return new Response('Locked', { status: 423 });
+		}
 	}
 	let depth: (typeof VALID_LOCK_DEPTHS)[number];
 	if (existingLock !== undefined && depthHeader === null && body === '') {
@@ -1375,11 +1438,16 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	let lockDetails: LockDetails = {
 		token: existingLock?.token ?? crypto.randomUUID(),
 		owner: owner ?? existingLock?.owner,
+		scope: existingLock?.scope ?? requestedScope,
 		depth,
 		timeout,
 		expiresAt,
 		root: getResourceHref(resource.key, resource.customMetadata?.resourcetype === '<collection />'),
 	};
+	let updatedLocks =
+		existingLock === undefined
+			? [...currentLocks, lockDetails]
+			: currentLocks.map((currentLock) => (currentLock.token === existingLock.token ? lockDetails : currentLock));
 
 	let source = await bucket.get(resource.key);
 	if (source === null) {
@@ -1388,11 +1456,11 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 
 	await bucket.put(resource.key, source.body, {
 		httpMetadata: source.httpMetadata,
-		customMetadata: withLockMetadata(resource.customMetadata, lockDetails),
+		customMetadata: withLockMetadata(resource.customMetadata, updatedLocks),
 	});
 
 	return new Response(
-		`<?xml version="1.0" encoding="utf-8"?>\n<prop xmlns="DAV:"><lockdiscovery>${getLockDiscovery(lockDetails)}</lockdiscovery></prop>`,
+		`<?xml version="1.0" encoding="utf-8"?>\n<prop xmlns="DAV:"><lockdiscovery>${getLockDiscovery(updatedLocks)}</lockdiscovery></prop>`,
 		{
 			status: existingLock ? 200 : 201,
 			headers: {
@@ -1425,7 +1493,8 @@ async function handle_unlock(request: Request, bucket: R2Bucket): Promise<Respon
 	}
 
 	let lockDetails = getLockDetails(resource.customMetadata);
-	if (lockDetails === undefined || normalizeLockToken(lockToken) !== lockDetails.token) {
+	let normalizedToken = normalizeLockToken(lockToken);
+	if (!lockDetails.some((lockDetail) => lockDetail.token === normalizedToken)) {
 		return new Response('Conflict', { status: 409 });
 	}
 
@@ -1436,7 +1505,10 @@ async function handle_unlock(request: Request, bucket: R2Bucket): Promise<Respon
 
 	await bucket.put(resource.key, source.body, {
 		httpMetadata: source.httpMetadata,
-		customMetadata: stripLockMetadata(resource.customMetadata),
+		customMetadata: withLockMetadata(
+			resource.customMetadata,
+			lockDetails.filter((lockDetail) => lockDetail.token !== normalizedToken),
+		),
 	});
 
 	return new Response(null, { status: 204 });
