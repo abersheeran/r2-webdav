@@ -1,0 +1,76 @@
+name: litmus
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  litmus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TEST_USERNAME: test
+      TEST_PASSWORD: test
+      WRANGLER_PORT: 8787
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install litmus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y litmus
+
+      - name: Configure development credentials
+        run: |
+          cat <<EOF > .dev.vars
+          USERNAME=${TEST_USERNAME}
+          PASSWORD=${TEST_PASSWORD}
+          EOF
+
+      - name: Start Wrangler
+        run: |
+          nohup npx wrangler dev --local --port "${WRANGLER_PORT}" > /tmp/wrangler.log 2>&1 &
+          echo $! > /tmp/wrangler.pid
+
+      - name: Wait for Wrangler
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --user "${TEST_USERNAME}:${TEST_PASSWORD}" "http://127.0.0.1:${WRANGLER_PORT}/" > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/wrangler.log
+          exit 1
+
+      - name: Run litmus
+        env:
+          TESTS: basic copymove props locks
+        run: TESTS="$TESTS" litmus -k "http://127.0.0.1:${WRANGLER_PORT}/" "${TEST_USERNAME}" "${TEST_PASSWORD}"
+
+      - name: Print Wrangler log on failure
+        if: failure()
+        run: cat /tmp/wrangler.log
+
+      - name: Stop Wrangler
+        if: always()
+        run: |
+          if [ -f /tmp/wrangler.pid ]; then
+            kill "$(cat /tmp/wrangler.pid)" || true
+          fi
