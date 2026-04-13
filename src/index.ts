@@ -762,7 +762,7 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		} else {
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
 			const contentLength = rangeEnd - rangeOffset + 1;
-			const rangeRequested = object.range !== undefined;
+			const rangeRequested = request.headers.has('Range') && object.range !== undefined;
 			return new Response(object.body, {
 				status: rangeRequested ? 206 : 200,
 				headers: {
