@@ -161,7 +161,15 @@ async function hasCollectionResource(bucket: R2Bucket, resourcePath: string): Pr
 	}
 
 	let resource = await bucket.head(resourcePath);
-	return resource?.customMetadata?.resourcetype === '<collection />';
+	if (resource !== null) {
+		return resource.customMetadata?.resourcetype === '<collection />';
+	}
+
+	let descendants = await bucket.list({
+		prefix: resourcePath + '/',
+		limit: 1,
+	});
+	return descendants.objects.length > 0;
 }
 
 function parseDestinationPath(destinationHeader: string, requestUrl: string): string | null {
@@ -833,11 +841,8 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 
 	// Check if the parent directory exists
 	let dirpath = getParentPath(resource_path);
-	if (dirpath !== '') {
-		let dir = await bucket.head(dirpath);
-		if (!(dir && dir.customMetadata?.resourcetype === '<collection />')) {
-			return new Response('Conflict', { status: 409 });
-		}
+	if (!(await hasCollectionResource(bucket, dirpath))) {
+		return new Response('Conflict', { status: 409 });
 	}
 
 	let body = await request.arrayBuffer();
