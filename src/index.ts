@@ -210,7 +210,7 @@ function createdResponse(
 
 function renderDavProperty(propName: string, value: string): string {
 	let content = RAW_XML_DAV_PROPERTIES.has(propName) ? value : escapeXml(value);
-	return `<${propName}>${content}</${propName}>`;
+	return `<D:${propName}>${content}</D:${propName}>`;
 }
 
 function serializeNodeChildren(node: Node): string {
@@ -362,8 +362,8 @@ function parseProppatchRequest(body: string): { operations: ProppatchOperation[]
 
 function getSupportedLock(): string {
 	return [
-		'<lockentry><lockscope><exclusive /></lockscope><locktype><write /></locktype></lockentry>',
-		'<lockentry><lockscope><shared /></lockscope><locktype><write /></locktype></lockentry>',
+		'<D:lockentry><D:lockscope><D:exclusive /></D:lockscope><D:locktype><D:write /></D:locktype></D:lockentry>',
+		'<D:lockentry><D:lockscope><D:shared /></D:lockscope><D:locktype><D:write /></D:locktype></D:lockentry>',
 	].join('');
 }
 
@@ -443,7 +443,7 @@ function getLockDiscovery(lockDetails: LockDetails | LockDetails[]): string {
 	return lockDetailList
 		.map(
 			(lockDetail) =>
-				`<activelock><locktype><write /></locktype><lockscope><${lockDetail.scope} /></lockscope><depth>${lockDetail.depth}</depth>${lockDetail.owner ? `<owner>${escapeXml(lockDetail.owner)}</owner>` : ''}<timeout>${escapeXml(lockDetail.timeout)}</timeout><locktoken><href>urn:uuid:${escapeXml(lockDetail.token)}</href></locktoken><lockroot><href>${escapeXml(lockDetail.root)}</href></lockroot></activelock>`,
+				`<D:activelock><D:locktype><D:write /></D:locktype><D:lockscope><D:${lockDetail.scope} /></D:lockscope><D:depth>${lockDetail.depth}</D:depth>${lockDetail.owner ? `<D:owner>${escapeXml(lockDetail.owner)}</D:owner>` : ''}<D:timeout>${escapeXml(lockDetail.timeout)}</D:timeout><D:locktoken><D:href>urn:uuid:${escapeXml(lockDetail.token)}</D:href></D:locktoken><D:lockroot><D:href>${escapeXml(lockDetail.root)}</D:href></D:lockroot></D:activelock>`,
 		)
 		.join('');
 }
@@ -577,7 +577,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 			getcontenttype: undefined,
 			getetag: undefined,
 			getlastmodified: new Date().toUTCString(),
-			resourcetype: '<collection />',
+			resourcetype: '<D:collection />',
 			supportedlock: getSupportedLock(),
 			lockdiscovery: '',
 		};
@@ -593,7 +593,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 		getcontenttype: object.httpMetadata?.contentType,
 		getetag: object.etag,
 		getlastmodified: object.uploaded.toUTCString(),
-		resourcetype: object.customMetadata?.resourcetype ?? '',
+		resourcetype: isCollection ? '<D:collection />' : '',
 		supportedlock: getSupportedLock(),
 		lockdiscovery:
 			lockDetails.length === 0
@@ -619,12 +619,12 @@ function renderPropstat(status: string, properties: string[]): string {
 		return '';
 	}
 	return `
-		<propstat>
-			<prop>
+		<D:propstat>
+			<D:prop>
 			${properties.join('\n				')}
-			</prop>
-			<status>${status}</status>
-		</propstat>`;
+			</D:prop>
+			<D:status>${status}</D:status>
+		</D:propstat>`;
 }
 
 function make_resource_path(request: Request): string {
@@ -983,9 +983,9 @@ function generate_propfind_response(object: R2Object | null, propfindRequest: Pr
 	}
 
 	return `
-	<response>
-		<href>${escapeXml(href)}</href>${renderPropstat('HTTP/1.1 200 OK', okProperties)}${renderPropstat('HTTP/1.1 404 Not Found', missingProperties)}
-	</response>`;
+	<D:response>
+		<D:href>${escapeXml(href)}</D:href>${renderPropstat('HTTP/1.1 200 OK', okProperties)}${renderPropstat('HTTP/1.1 404 Not Found', missingProperties)}
+	</D:response>`;
 }
 
 async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
@@ -997,7 +997,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 
 	let is_collection: boolean;
 	let page = `<?xml version="1.0" encoding="utf-8"?>
-<multistatus xmlns="DAV:">`;
+<D:multistatus xmlns:D="DAV:">`;
 
 	if (resource_path === '') {
 		page += generate_propfind_response(null, propfindRequest);
@@ -1038,7 +1038,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 		}
 	}
 
-	page += '\n</multistatus>\n';
+	page += '\n</D:multistatus>\n';
 	return new Response(page, {
 		status: 207,
 		headers: {
@@ -1133,11 +1133,11 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 		appendPropstat(property, 'HTTP/1.1 403 Forbidden');
 	}
 
-	let responseXML = `<?xml version="1.0" encoding="utf-8"?>\n<multistatus xmlns="DAV:">\n\t<response>\n\t\t<href>${escapeXml(getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />'))}</href>`;
+	let responseXML = `<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">\n\t<D:response>\n\t\t<D:href>${escapeXml(getResourceHref(object.key, object.customMetadata?.resourcetype === '<collection />'))}</D:href>`;
 	for (const [status, propNames] of propstats) {
-		responseXML += `\n\t\t<propstat>\n\t\t\t<prop>\n${propNames.map((propName) => `\t\t\t\t${propName}`).join('\n')}\n\t\t\t</prop>\n\t\t\t<status>${status}</status>\n\t\t</propstat>`;
+		responseXML += `\n\t\t<D:propstat>\n\t\t\t<D:prop>\n${propNames.map((propName) => `\t\t\t\t${propName}`).join('\n')}\n\t\t\t</D:prop>\n\t\t\t<D:status>${status}</D:status>\n\t\t</D:propstat>`;
 	}
-	responseXML += '\n\t</response>\n</multistatus>';
+	responseXML += '\n\t</D:response>\n</D:multistatus>';
 
 	return new Response(responseXML, {
 		status: 207,
@@ -1465,7 +1465,7 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	});
 
 	return new Response(
-		`<?xml version="1.0" encoding="utf-8"?>\n<prop xmlns="DAV:"><lockdiscovery>${getLockDiscovery(updatedLocks)}</lockdiscovery></prop>`,
+		`<?xml version="1.0" encoding="utf-8"?>\n<D:prop xmlns:D="DAV:"><D:lockdiscovery>${getLockDiscovery(updatedLocks)}</D:lockdiscovery></D:prop>`,
 		{
 			status: existingLock ? 200 : 201,
 			headers: {
