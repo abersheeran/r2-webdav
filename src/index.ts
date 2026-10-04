@@ -558,7 +558,7 @@ function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
 }
 
 function extractLockOwner(body: string): string | undefined {
-	let owner = body.match(/<owner(?:\s[^>]*)?>([\s\S]*?)<\/owner>/i)?.[1];
+	let owner = body.match(/<(?:[\w.-]+:)?owner(?:\s[^>]*)?>([\s\S]*?)<\/(?:[\w.-]+:)?owner>/i)?.[1];
 	if (owner === undefined) {
 		return undefined;
 	}
@@ -1373,9 +1373,9 @@ async function handle_lock(request: Request, bucket: R2Bucket): Promise<Response
 	let { timeout, expiresAt } = parseTimeout(request.headers.get('Timeout'));
 	let body = await request.text();
 	// Per WebDAV, an empty LOCK request body indicates a lock refresh operation.
-	let requestedScope: LockDetails['scope'] = /<shared\b/i.test(body) ? 'shared' : 'exclusive';
+	let requestedScope: LockDetails['scope'] = /<(?:[\w.-]+:)?shared\b/i.test(body) ? 'shared' : 'exclusive';
 	let requestLockTokens = getRequestLockTokens(request);
-	if (body !== '' && !/<write\b/i.test(body)) {
+	if (body !== '' && !/<(?:[\w.-]+:)?write\b/i.test(body)) {
 		return new Response('Bad Request', { status: 400 });
 	}
 	let owner = extractLockOwner(body);
