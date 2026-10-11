@@ -766,7 +766,10 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		if (object === null) {
 			return new Response('Not Found', { status: 404 });
 		} else if (!isR2ObjectBody(object)) {
-			return new Response('Precondition Failed', { status: 412 });
+			// A satisfied If-None-Match means "not modified"; every other failed precondition is 412.
+			return new Response(null, {
+				status: request.headers.has('If-None-Match') ? 304 : 412,
+			});
 		} else {
 			const { rangeOffset, rangeEnd } = calcContentRange(object);
 			const contentLength = rangeEnd - rangeOffset + 1;
