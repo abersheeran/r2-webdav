@@ -6,6 +6,8 @@ Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
 Currently the server advertises WebDAV Class 1 and Class 2 (LOCK/UNLOCK) support.
 
+`GET`, `HEAD` and `PUT` responses carry a quoted `ETag` (plus `Last-Modified`), and `PROPFIND` exposes the same value as `getetag`, so WebDAV clients can cache and sync by entity tag. Conditional requests (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) are honoured: a failed `If-Match`/`If-Unmodified-Since` returns `412`, while a not-modified `If-None-Match`/`If-Modified-Since` returns `304`.
+
 ## Usage
 
 Change wrangler.toml to your own.

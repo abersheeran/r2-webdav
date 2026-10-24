@@ -1,0 +1,119 @@
+diff --git a/README.md b/README.md
+index e1492a8..c5f741d 100644
+--- a/README.md
++++ b/README.md
+@@ -6,6 +6,8 @@ Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
+ 
+ Currently the server advertises WebDAV Class 1 and Class 2 (LOCK/UNLOCK) support.
+ 
++`GET`, `HEAD` and `PUT` responses carry a quoted `ETag` (plus `Last-Modified`), and `PROPFIND` exposes the same value as `getetag`, so WebDAV clients can cache and sync by entity tag. Conditional requests (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) are honoured: a failed `If-Match`/`If-Unmodified-Since` returns `412`, while a not-modified `If-None-Match`/`If-Modified-Since` returns `304`.
++
+ ## Usage
+ 
+ Change wrangler.toml to your own.
+diff --git a/src/index.ts b/src/index.ts
+index 4692941..5b2217b 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -567,6 +567,15 @@ function extractLockOwner(body: string): string | undefined {
+ 	return owner === '' ? undefined : owner;
+ }
+ 
++function normalizeEtag(etag: string): string {
++	// RFC 9110 entity-tags must be quoted (weak tags keep their W/ prefix).
++	return /^(?:W\/)?"[\s\S]*"$/.test(etag) ? etag : `"${etag}"`;
++}
++
++function getObjectEtag(object: Pick<R2Object, 'etag' | 'httpEtag'>): string {
++	return normalizeEtag(object.httpEtag ?? object.etag);
++}
++
+ function fromR2Object(object: R2Object | null | undefined): DavProperties {
+ 	if (object === null || object === undefined) {
+ 		return {
+@@ -591,7 +600,7 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
+ 		getcontentlanguage: object.httpMetadata?.contentLanguage,
+ 		getcontentlength: object.size.toString(),
+ 		getcontenttype: object.httpMetadata?.contentType,
+-		getetag: object.etag,
++		getetag: getObjectEtag(object),
+ 		getlastmodified: object.uploaded.toUTCString(),
+ 		resourcetype: object.customMetadata?.resourcetype ?? '',
+ 		supportedlock: getSupportedLock(),
+@@ -764,11 +773,30 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
+ 		};
+ 
+ 		if (object === null) {
++			// R2 returns null (instead of an object) when If-Match/If-Unmodified-Since fails,
++			// so distinguish that from a genuinely missing resource.
++			if (request.headers.has('If-Match') || request.headers.has('If-Unmodified-Since')) {
++				let existing = await bucket.head(resource_path);
++				if (existing !== null) {
++					return new Response('Precondition Failed', {
++						status: 412,
++						headers: {
++							ETag: getObjectEtag(existing),
++							'Last-Modified': existing.uploaded.toUTCString(),
++						},
++					});
++				}
++			}
+ 			return new Response('Not Found', { status: 404 });
+ 		} else if (!isR2ObjectBody(object)) {
+-			// A satisfied If-None-Match means "not modified"; every other failed precondition is 412.
++			// A satisfied If-None-Match/If-Modified-Since means "not modified"; every other failed precondition is 412.
++			let notModified = request.headers.has('If-None-Match') || request.headers.has('If-Modified-Since');
+ 			return new Response(null, {
+-				status: request.headers.has('If-None-Match') ? 304 : 412,
++				status: notModified ? 304 : 412,
++				headers: {
++					ETag: getObjectEtag(object),
++					'Last-Modified': object.uploaded.toUTCString(),
++				},
+ 			});
+ 		} else {
+ 			const { rangeOffset, rangeEnd } = calcContentRange(object);
+@@ -778,6 +806,8 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
+ 				status: rangeRequested ? 206 : 200,
+ 				headers: {
+ 					'Accept-Ranges': 'bytes',
++					ETag: getObjectEtag(object),
++					'Last-Modified': object.uploaded.toUTCString(),
+ 					'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+ 					'Content-Length': contentLength.toString(),
+ 					...(rangeRequested ? { 'Content-Range': `bytes ${rangeOffset}-${rangeEnd}/${object.size}` } : {}),
+@@ -849,12 +879,28 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
+ 	}
+ 
+ 	let body = await request.arrayBuffer();
+-	await bucket.put(resource_path, body, {
+-		onlyIf: request.headers,
+-		httpMetadata: request.headers,
+-		customMetadata: getPreservedCustomMetadata(existing?.customMetadata),
+-	});
+-	return existing === null ? new Response('', { status: 201 }) : new Response(null, { status: 204 });
++	let uploaded: R2Object | null;
++	try {
++		uploaded = await bucket.put(resource_path, body, {
++			onlyIf: request.headers,
++			httpMetadata: request.headers,
++			customMetadata: getPreservedCustomMetadata(existing?.customMetadata),
++		});
++	} catch (error) {
++		// R2 throws instead of returning a null object when an If-Match/If-None-Match precondition fails.
++		if ((error as { code?: string } | null)?.code === 'PreconditionFailed') {
++			return new Response('Precondition Failed', { status: 412 });
++		}
++		throw error;
++	}
++	if (uploaded === null) {
++		// Some R2 API versions return null instead of throwing when the precondition fails.
++		return new Response('Precondition Failed', { status: 412 });
++	}
++	let responseHeaders = { ETag: getObjectEtag(uploaded) };
++	return existing === null
++		? new Response('', { status: 201, headers: responseHeaders })
++		: new Response(null, { status: 204, headers: responseHeaders });
+ }
+ 
+ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Response> {
